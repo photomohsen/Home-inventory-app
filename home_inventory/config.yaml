@@ -1,0 +1,25 @@
+name: "Home Inventory"
+version: "1.1.0"
+slug: "home_inventory"
+description: "Search, register and track household items across rooms, storage units and cells. Trilingual EN/FA/DA, barcode + QR scanning, borrow tracking."
+url: "https://github.com/photomohsen/Home-inventory-app"
+arch:
+  - aarch64
+  - amd64
+init: false
+ingress: true
+ingress_port: 8099
+ingress_stream: true
+panel_icon: "mdi:package-variant-closed"
+panel_title: "Inventory"
+panel_admin: false
+# NFC (v1.1.0): homeassistant_api for the Core websocket (tag_scanned events,
+# tag/device registries) + REST (notify.* services) via the Supervisor proxy
+# with SUPERVISOR_TOKEN; hassio_api ONLY for GET /addons/self/info to discover
+# our ingress_entry for notification deep links.
+homeassistant_api: true
+hassio_api: true
+# Least privilege — still intentionally NO: ports, map, host_network.
+# /data is always mounted writable without a map entry.
+options: {}
+schema: {}

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<!-- BASE_HREF_PLACEHOLDER: the backend replaces the first real <base> tag below with
+     <base href="{X-Ingress-Path}/"> at serve time. Keep it on its own line in <head>. -->
+<base href="./">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#5b7553" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1a1f18" media="(prefers-color-scheme: dark)">
+<meta name="description" content="Search, register and track household items across rooms, storage units and cells.">
+<title>Home Inventory</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<!-- App mount node. The SPA renders everything inside #app. -->
+<div id="app" class="app">
+  <noscript>This app requires JavaScript.</noscript>
+</div>
+
+<!-- ARIA live region for result counts + toast announcements (visually hidden).
+     This is the SINGLE announcement channel; the toast host below is purely visual
+     (no aria-live) so screen readers never read a toast twice. -->
+<div id="live" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+
+<!-- Toast host (visual only — announcements go through #live). -->
+<div id="toasts" class="toast-host"></div>
+
+<!-- Modal / sheet host -->
+<div id="modal-root"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
