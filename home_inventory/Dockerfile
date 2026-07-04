@@ -8,7 +8,7 @@ WORKDIR /app
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY server.py db.py normalize.py /app/
+COPY server.py db.py normalize.py ha_client.py /app/
 COPY www /app/www
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
@@ -16,6 +16,6 @@ RUN chmod a+x /run.sh
 LABEL \
   io.hass.type="addon" \
   io.hass.name="Home Inventory" \
-  io.hass.version="1.1.0"
+  io.hass.version="2.0.1"
 
 CMD [ "/run.sh" ]
