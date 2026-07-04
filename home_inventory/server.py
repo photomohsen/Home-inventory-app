@@ -69,7 +69,7 @@ IMAGES_DIR = os.path.join(DATA_DIR, "images")
 INGRESS_ALLOWED_IP = "172.30.32.2"
 THUMB_MAX_EDGE = 256
 OFF_TIMEOUT = 4  # seconds — short so an offline box degrades fast
-OFF_UA = "HomeInventory/1.0 (Home Assistant add-on; https://github.com/mohsen/home_inventory)"
+OFF_UA = "HomeInventory/2.0 (Home Assistant add-on; https://github.com/photomohsen/Home-inventory-app)"
 
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(IMAGES_DIR, exist_ok=True)

@@ -16,6 +16,6 @@ RUN chmod a+x /run.sh
 LABEL \
   io.hass.type="addon" \
   io.hass.name="Home Inventory" \
-  io.hass.version="2.0.1"
+  io.hass.version="2.0.2"
 
 CMD [ "/run.sh" ]

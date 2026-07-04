@@ -1,5 +1,5 @@
 name: "Home Inventory"
-version: "2.0.1"
+version: "2.0.2"
 slug: "home_inventory"
 description: "Search, register and track household items across rooms, grid shelves and to-scale closet layouts. Trilingual EN/FA/DA, barcode + QR + NFC, borrow tracking."
 url: "https://github.com/photomohsen/Home-inventory-app"
