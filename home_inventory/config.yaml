@@ -1,7 +1,7 @@
 name: "Home Inventory"
-version: "1.1.0"
+version: "2.0.0"
 slug: "home_inventory"
-description: "Search, register and track household items across rooms, storage units and cells. Trilingual EN/FA/DA, barcode + QR scanning, borrow tracking."
+description: "Search, register and track household items across rooms, grid shelves and to-scale closet layouts. Trilingual EN/FA/DA, barcode + QR + NFC, borrow tracking."
 url: "https://github.com/photomohsen/Home-inventory-app"
 arch:
   - aarch64

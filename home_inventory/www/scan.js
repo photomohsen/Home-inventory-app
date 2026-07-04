@@ -48,7 +48,13 @@ function buildOverlay() {
   root.innerHTML = `
     <div class="scanner__video-wrap">
       <video class="scanner__video" playsinline muted autoplay></video>
-      <div class="scanner__reticle" aria-hidden="true"></div>
+      <div class="scanner__reticle" aria-hidden="true">
+        <span class="scanner__corner scanner__corner--tl"></span>
+        <span class="scanner__corner scanner__corner--tr"></span>
+        <span class="scanner__corner scanner__corner--bl"></span>
+        <span class="scanner__corner scanner__corner--br"></span>
+        <span class="scanner__scanline"></span>
+      </div>
       <p class="scanner__hint">${t('scan_hint')}</p>
     </div>
     <div class="scanner__bar">

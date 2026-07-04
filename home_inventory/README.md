@@ -10,6 +10,17 @@ authenticated by HA automatically (no extra login), works in the HA companion ap
 over your remote URL, and stores all data inside the add-on (survives restarts and
 updates).
 
+## What's new in v2.0
+
+- **Full visual redesign** — a warm editorial look (paper tones, Fraunces serif,
+  sage + terracotta) replaces the plain v1 UI.
+- **Closet layouts** — units are no longer limited to a uniform grid. Wardrobes and
+  closets are now mapped as to-scale **sections & zones** (shelves, hanging rails,
+  drawers, baskets) with a live **composer** and ready-made templates (incl. an
+  L-shaped PAX). Grid shelves still work exactly as before.
+- **Clearer add-item flow** — the barcode is shown on the form and every field
+  validates inline (no more silent "nothing happened").
+
 ## Features
 
 - **Trilingual** — English / فارسی / Dansk everywhere, with full **right-to-left**
@@ -18,9 +29,13 @@ updates).
 - **Instant fuzzy search** across all three languages + brand + tags + barcode, with
   match highlighting — and a **Places** group when your query matches a room, unit or
   compartment name.
-- **Schematic grid maps** of each storage unit. Compartments are either **door**
-  (closed, trackable storage) or **open** (exposed display); search hits highlight and
-  auto-open the right door.
+- **To-scale storage maps** of every unit. **Grid shelves** have compartments that are
+  either **door** (closed, trackable storage) or **open** (exposed display). **Closets**
+  are drawn as real **sections & zones** — shelves, hanging rails, drawers and baskets,
+  sized in centimetres — so a search highlights the exact drawer or shelf an item is in.
+- **Closet composer** — map a wardrobe from a template (incl. an L-shaped PAX) or from
+  scratch: add sections and zones, set widths and heights, and watch a live to-scale
+  blueprint update as you go.
 - **Barcode & QR scanning** with the phone camera (fully offline; optional online
   product-name lookup when internet is available).
 - **NFC tags** — assign a Home Assistant tag to an item, a unit or a door
@@ -28,7 +43,8 @@ updates).
   a place tag opens that spot on the map. See below.
 - **Borrow tracking** — who has what, since when, when it's due, one-tap return.
 - **Per-item photos** (auto-thumbnailed), quantities, categories, tags, notes.
-- **Sage-green theme**, light/dark modes, large tap targets, screen-reader friendly.
+- **Warm editorial design** — paper tones, a Fraunces serif display face and a sage +
+  terracotta palette — with light/dark modes, large tap targets and screen-reader support.
 
 ## First run — starts empty
 
@@ -38,7 +54,7 @@ The app seeds **structure only**, no demo items:
   (each with English/Persian/Danish names).
 - The Entrance **Pigeon-hole shelf** as a 6×6 grid (labels A1–F6): 14 door
   compartments, the rest open display cells — edit the layout in the grid editor.
-- A no-grid **Wardrobe** in the Bedroom.
+- A **Wardrobe** in the Bedroom, ready to map as a closet (sections & zones).
 
 Your inventory starts at zero items; add the first one with the camera button.
 The **⋮ menu** offers **Reset structure (rooms & pigeon-hole)** — deletes everything

@@ -27,7 +27,11 @@ CREATE TABLE IF NOT EXISTS rooms (
 );
 
 -- Storage units inside a room (e.g. "Tool cabinet", "Pantry shelf").
--- A unit may have a grid (rows x cols); if rows/cols are 0 it has no grid.
+-- layout: 'grid'   = uniform rows x cols grid of cells (grid_rows/grid_cols > 0);
+--         'closet' = vertical sections (unit_sections) stacked with zones
+--                    (cells: col = section index, row = zone index, top = 0);
+--         'none'   = no internal layout (plain unit).
+-- height_cm: physical height (closet mode; nullable).
 CREATE TABLE IF NOT EXISTS storage_units (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   room_id     INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
@@ -36,14 +40,33 @@ CREATE TABLE IF NOT EXISTS storage_units (
   name_da     TEXT NOT NULL DEFAULT '',
   grid_rows   INTEGER NOT NULL DEFAULT 0,
   grid_cols   INTEGER NOT NULL DEFAULT 0,
+  layout      TEXT NOT NULL DEFAULT 'none' CHECK (layout IN ('grid','closet','none')),
+  height_cm   REAL,
   sort_order  INTEGER NOT NULL DEFAULT 0,
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_units_room ON storage_units(room_id);
 
--- Cells = individual compartments in a unit's grid. row/col are 0-based.
--- kind: 'door' = closed compartment (trackable storage, assignable, interactive);
---       'open' = exposed display cubby (NOT storage, not assignable, faded/non-interactive).
+-- Closet sections (layout='closet'): vertical columns left->right.
+-- col_index matches cells.col for the zones inside the section.
+CREATE TABLE IF NOT EXISTS unit_sections (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  unit_id     INTEGER NOT NULL REFERENCES storage_units(id) ON DELETE CASCADE,
+  col_index   INTEGER NOT NULL,
+  width_cm    REAL NOT NULL,
+  corner      INTEGER NOT NULL DEFAULT 0,
+  sort        INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(unit_id, col_index)
+);
+CREATE INDEX IF NOT EXISTS idx_sections_unit ON unit_sections(unit_id);
+
+-- Cells = individual compartments in a unit's grid, OR zones in a closet
+-- section (col = section index, row = zone index within the section, 0 = top).
+-- kind (grid):   'door' = closed compartment (trackable storage, assignable);
+--                'open' = exposed display cubby (NOT storage, not assignable).
+-- kind (closet): 'drawer'|'shelf'|'hanging'|'basket' = trackable zones;
+--                'open' = open space, display-only (same rule as grid 'open').
+-- height_cm: zone height in cm (closet mode); NULL = flex / equal share.
 CREATE TABLE IF NOT EXISTS cells (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   unit_id     INTEGER NOT NULL REFERENCES storage_units(id) ON DELETE CASCADE,
@@ -54,7 +77,9 @@ CREATE TABLE IF NOT EXISTS cells (
   label_en    TEXT NOT NULL DEFAULT '',
   label_fa    TEXT NOT NULL DEFAULT '',
   label_da    TEXT NOT NULL DEFAULT '',
-  kind        TEXT NOT NULL DEFAULT 'door' CHECK (kind IN ('door','open')),
+  kind        TEXT NOT NULL DEFAULT 'door'
+              CHECK (kind IN ('door','open','drawer','shelf','hanging','basket')),
+  height_cm   REAL,
   UNIQUE(unit_id, row, col)
 );
 CREATE INDEX IF NOT EXISTS idx_cells_unit ON cells(unit_id);
@@ -137,6 +162,7 @@ ALL_TABLES = (
     "item_locations",
     "items",
     "cells",
+    "unit_sections",
     "storage_units",
     "rooms",
 )
@@ -158,6 +184,28 @@ def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return any(r["name"] == column for r in rows)
 
 
+# The post-closet-migration cells table. Must stay in sync with the `cells`
+# definition in SCHEMA_SQL above (used by the rename-copy-swap rebuild that
+# widens the kind CHECK — SQLite cannot ALTER a CHECK constraint in place).
+_CELLS_REBUILD_DDL = """
+CREATE TABLE cells_new (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  unit_id     INTEGER NOT NULL REFERENCES storage_units(id) ON DELETE CASCADE,
+  row         INTEGER NOT NULL,
+  col         INTEGER NOT NULL,
+  row_span    INTEGER NOT NULL DEFAULT 1,
+  col_span    INTEGER NOT NULL DEFAULT 1,
+  label_en    TEXT NOT NULL DEFAULT '',
+  label_fa    TEXT NOT NULL DEFAULT '',
+  label_da    TEXT NOT NULL DEFAULT '',
+  kind        TEXT NOT NULL DEFAULT 'door'
+              CHECK (kind IN ('door','open','drawer','shelf','hanging','basket')),
+  height_cm   REAL,
+  UNIQUE(unit_id, row, col)
+)
+"""
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """
     Idempotent, defensive migrations for DBs created by an older schema.
@@ -167,15 +215,71 @@ def _migrate(conn: sqlite3.Connection) -> None:
     column here. ALTER ... ADD COLUMN with a non-NULL default backfills every
     existing row to 'door'. No-op on a fresh or already-migrated DB.
 
-    nfc_tags (iteration 3) needs no entry here: it is a brand-new TABLE, so the
-    CREATE TABLE IF NOT EXISTS in SCHEMA_SQL (run on every startup) adds it to
-    existing production DBs in place.
+    nfc_tags (iteration 3) / unit_sections (closet layouts) need no entry here:
+    brand-new TABLES are added to existing production DBs by the CREATE TABLE
+    IF NOT EXISTS in SCHEMA_SQL (run on every startup).
+
+    Closet layouts:
+      1. storage_units gains layout ('grid'|'closet'|'none') + height_cm via
+         ALTER; existing rows are mapped grid_rows>0 -> 'grid', else 'none'.
+      2. cells gains height_cm AND a widened kind CHECK (closet zone kinds).
+         SQLite cannot alter a CHECK, so this is a rename-copy-swap rebuild
+         preserving row ids (item_locations.cell_id / nfc_tags cell targets
+         keep working). Runs with foreign_keys=OFF inside one transaction,
+         then verifies with PRAGMA foreign_key_check.
     """
     if not _column_exists(conn, "cells", "kind"):
         conn.execute(
             "ALTER TABLE cells ADD COLUMN kind TEXT NOT NULL DEFAULT 'door'"
         )
         conn.commit()
+
+    # --- storage_units: layout + height_cm --------------------------------
+    if not _column_exists(conn, "storage_units", "layout"):
+        conn.execute(
+            "ALTER TABLE storage_units ADD COLUMN layout TEXT NOT NULL "
+            "DEFAULT 'none' CHECK (layout IN ('grid','closet','none'))"
+        )
+        # Map existing rows: a unit with a grid keeps behaving as a grid.
+        conn.execute(
+            "UPDATE storage_units SET layout='grid' WHERE grid_rows > 0"
+        )
+        conn.commit()
+    if not _column_exists(conn, "storage_units", "height_cm"):
+        conn.execute("ALTER TABLE storage_units ADD COLUMN height_cm REAL")
+        conn.commit()
+
+    # --- cells: height_cm + widened kind CHECK (table rebuild) ------------
+    if not _column_exists(conn, "cells", "height_cm"):
+        conn.commit()  # close any implicit transaction before the PRAGMA
+        conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(_CELLS_REBUILD_DDL)
+            conn.execute(
+                "INSERT INTO cells_new "
+                "(id, unit_id, row, col, row_span, col_span, "
+                " label_en, label_fa, label_da, kind, height_cm) "
+                "SELECT id, unit_id, row, col, row_span, col_span, "
+                "       label_en, label_fa, label_da, kind, NULL FROM cells"
+            )
+            conn.execute("DROP TABLE cells")
+            conn.execute("ALTER TABLE cells_new RENAME TO cells")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cells_unit ON cells(unit_id)"
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys=ON")
+        bad = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if bad:
+            raise RuntimeError(
+                "foreign_key_check failed after cells rebuild: "
+                + repr([tuple(r) for r in bad])
+            )
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
@@ -193,8 +297,8 @@ def wipe_all(conn: sqlite3.Connection) -> None:
     # Reset AUTOINCREMENT counters so a reset looks like a fresh install.
     cur.execute(
         "DELETE FROM sqlite_sequence WHERE name IN "
-        "('rooms','storage_units','cells','items','item_locations','borrows',"
-        "'nfc_tags')"
+        "('rooms','storage_units','unit_sections','cells','items',"
+        "'item_locations','borrows','nfc_tags')"
     )
     conn.commit()
 
@@ -309,10 +413,11 @@ def seed(conn: sqlite3.Connection, normalize) -> None:
     # --- Entrance: 6x6 "Pigeon-hole shelf" with auto-created 36 cells ---
     cur.execute(
         "INSERT INTO storage_units "
-        "(room_id, name_en, name_fa, name_da, grid_rows, grid_cols, sort_order) "
-        "VALUES (?,?,?,?,?,?,?)",
+        "(room_id, name_en, name_fa, name_da, grid_rows, grid_cols, layout, "
+        " sort_order) "
+        "VALUES (?,?,?,?,?,?,?,?)",
         (room_ids["Entrance"], "Pigeon-hole shelf", "قفسهٔ کبوترخانه",
-         "Reol med rum", 6, 6, 0),
+         "Reol med rum", 6, 6, "grid", 0),
     )
     pigeon_id = cur.lastrowid
 
@@ -331,9 +436,11 @@ def seed(conn: sqlite3.Connection, normalize) -> None:
     # --- Bedroom: non-grid "Wardrobe" (demonstrates no-grid / chip fallback) ---
     cur.execute(
         "INSERT INTO storage_units "
-        "(room_id, name_en, name_fa, name_da, grid_rows, grid_cols, sort_order) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (room_ids["Bedroom"], "Wardrobe", "کمد لباس", "Garderobe", 0, 0, 0),
+        "(room_id, name_en, name_fa, name_da, grid_rows, grid_cols, layout, "
+        " sort_order) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (room_ids["Bedroom"], "Wardrobe", "کمد لباس", "Garderobe", 0, 0,
+         "none", 0),
     )
 
     conn.commit()

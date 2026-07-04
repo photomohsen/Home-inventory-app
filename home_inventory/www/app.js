@@ -241,6 +241,15 @@ function miniMap(item, opts = {}) {
     return h('div', { class: 'minimap minimap--chip' }, t('no_location'));
   }
   const unit = pl.unit;
+  if (unitLayout(unit) === 'closet') {
+    // Closet -> to-scale miniature with the item's zone marked.
+    const m = closetSchematic(closetLayoutOf(unit), {
+      mode: 'mini', hereCellId: pl.cell ? pl.cell.id : null,
+    });
+    m.setAttribute('role', 'img');
+    m.setAttribute('aria-label', localName(unit));
+    return m;
+  }
   if (!unit.grid_rows || !unit.grid_cols) {
     // No grid -> plain location chip.
     return h('div', { class: 'minimap minimap--chip', title: localName(unit) }, localName(unit));
@@ -265,6 +274,224 @@ function miniMap(item, opts = {}) {
     }
   }
   return grid;
+}
+
+/* ============================================================ *
+ *  Closet layout — shared to-scale renderer (Phase D)          *
+ * ============================================================ */
+
+// Effective layout mode of a unit ('grid' | 'closet' | 'none').
+function unitLayout(u) {
+  if (!u) return 'none';
+  if (u.layout) return u.layout;
+  return (u.grid_rows && u.grid_cols) ? 'grid' : 'none';
+}
+
+// Build a renderable closet layout object from bootstrap state: each section
+// carries its zones (= the cells of that column, top -> bottom).
+function closetLayoutOf(unit) {
+  const secs = (unit.sections || []).slice().sort((a, b) => a.col - b.col);
+  const cells = state.cells.filter(c => c.unit_id === unit.id);
+  return {
+    height_cm: unit.height_cm != null ? unit.height_cm : 236,
+    sections: secs.map(s => ({
+      width_cm: s.width_cm, corner: !!s.corner,
+      zones: cells.filter(c => c.col === s.col).sort((a, b) => a.row - b.row)
+        .map(c => ({ kind: c.kind, height_cm: c.height_cm, cell: c })),
+    })),
+  };
+}
+
+// Localized label of a zone: live zones carry their cell; template/composer
+// zones carry raw label_en/fa/da fields.
+function zoneLabel(z) {
+  if (z.cell) return cellLabel(z.cell);
+  const lang = getLang();
+  return z['label_' + lang] || z.label_en || z.label_fa || z.label_da || '';
+}
+
+// Localized number (Persian digits under fa).
+function fmtNum(n) {
+  if (n == null || isNaN(n)) return '';
+  const v = Math.round(n * 10) / 10;
+  return getLang() === 'fa' ? v.toLocaleString('fa-IR') : String(v);
+}
+
+// Per-section effective zone heights (cm): fixed zones keep height_cm, flex
+// (null) zones share the leftover equally; a fixed-only section shorter than
+// the closet gets a phantom "rest" spacer so everything stays to scale.
+function closetEffHeights(section, totalH) {
+  const zs = section.zones;
+  const fixed = zs.reduce((s, z) => s + (z.height_cm != null ? Number(z.height_cm) : 0), 0);
+  const flexN = zs.filter(z => z.height_cm == null).length;
+  const flexH = flexN ? Math.max(8, (totalH - fixed) / flexN) : 0;
+  const eff = zs.map(z => (z.height_cm != null ? Number(z.height_cm) : flexH));
+  let total = eff.reduce((s, x) => s + x, 0);
+  let rest = 0;
+  if (!flexN && total < totalH - 0.5) { rest = totalH - total; total = totalH; }
+  return { eff, rest };
+}
+
+// Hanging-rail line art: rail + three wire hangers (stroke set in CSS).
+function closetRailSvg() {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('viewBox', '0 0 120 18');
+  svg.setAttribute('class', 'closet__rail');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('preserveAspectRatio', 'xMidYMin meet');
+  const p = document.createElementNS(ns, 'path');
+  p.setAttribute('d', 'M4 3h112' +
+    'M36 3v3l-6 9h12l-6-9M60 3v3l-6 9h12l-6-9M84 3v3l-6 9h12l-6-9');
+  svg.appendChild(p);
+  return svg;
+}
+
+// Small corner glyph for L-shaped (corner) sections.
+function closetCornerMark() {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('viewBox', '0 0 10 10');
+  svg.setAttribute('class', 'closet__cornermark');
+  svg.setAttribute('aria-hidden', 'true');
+  const p = document.createElementNS(ns, 'path');
+  p.setAttribute('d', 'M1.5 9V1.5H9');
+  svg.appendChild(p);
+  return svg;
+}
+
+// Shared to-scale closet renderer — an architectural drawing of the unit.
+// Sections sit side by side (widths proportional to width_cm); zones stack
+// inside each section (heights proportional to height_cm; flex zones share
+// the remainder). Kind-specific line art: drawer fronts with a handle,
+// shelf boards, hanging rails with wire hangers, recessed open bays,
+// crosshatched baskets. Corner sections get an angled cut + glyph.
+//
+// modes:
+//   'browse'  — trackable zones are buttons -> opts.onOpen(cell, btn, root);
+//               count badges; cm ruler + width labels (blueprint chrome).
+//   'picker'  — trackable zones select via opts.onPick(cell); open zones inert.
+//   'preview' — inert drawing with full blueprint chrome (composer).
+//   'mini'    — tiny miniature for tiles/mini-maps (no chrome, no labels).
+// opts: { mode, unit, highlightCellId, selectedCellId, hereCellId,
+//         filledCellIds:Set<cellId>, onOpen, onPick }
+function closetSchematic(layout, opts = {}) {
+  const mode = opts.mode || 'browse';
+  const mini = mode === 'mini';
+  const chrome = mode === 'browse' || mode === 'preview'; // ruler + width labels
+  const totalH = Math.max(Number(layout.height_cm) || 236, 1);
+  const totalW = Math.max(
+    layout.sections.reduce((s, x) => s + (Number(x.width_cm) || 0), 0), 1);
+
+  const root = h('div', { class: 'closet closet--' + mode });
+  const fig = h('div', { class: 'closet__fig' });
+  root.appendChild(fig);
+  const draw = h('div', { class: 'closet__draw' });
+  fig.appendChild(draw);
+
+  // Cap the drawing height (keeps narrow/tall closets from towering): the
+  // aspect-ratio keeps it to scale, the max width caps the derived height.
+  if (!mini) {
+    const maxH = mode === 'picker' ? 300 : 440;
+    fig.style.maxInlineSize =
+      (Math.round(maxH * totalW / totalH) + (chrome ? 34 : 0)) + 'px';
+  }
+
+  // cm ruler (blueprint chrome only).
+  if (chrome) {
+    const scale = h('div', { class: 'closet__scale', 'aria-hidden': 'true' });
+    const marks = [0];
+    for (let m = 50; m < totalH - 14; m += 50) marks.push(m);
+    marks.push(Math.round(totalH));
+    marks.forEach(m => {
+      scale.appendChild(h('span', {
+        class: 'closet__tick',
+        style: `inset-block-start:${(m / totalH) * 100}%`,
+      }, fmtNum(m)));
+    });
+    draw.appendChild(scale);
+  }
+
+  const sectionsEl = h('div', {
+    class: 'closet__sections',
+    style: `aspect-ratio:${totalW}/${totalH}`,
+  });
+  draw.appendChild(sectionsEl);
+
+  function zoneEl(z, effH) {
+    const cell = z.cell || null;
+    const trackable = z.kind !== 'open';
+    const interactive = (mode === 'browse' || mode === 'picker') && trackable && cell;
+    const isHit = cell && opts.highlightCellId != null && cell.id === opts.highlightCellId;
+    const isSel = cell && opts.selectedCellId != null && cell.id === opts.selectedCellId;
+    const isHere = cell && opts.hereCellId != null && cell.id === opts.hereCellId;
+    const isFilled = cell && opts.filledCellIds && opts.filledCellIds.has(cell.id);
+    const count = (mode === 'browse' && opts.unit && cell)
+      ? itemsInCell(opts.unit.id, cell.id).length : 0;
+    let cls = 'closet__zone closet__zone--' + z.kind;
+    if (isHit) cls += ' is-hit';
+    if (isSel) cls += ' is-selected';
+    if (isHere) cls += ' is-here';
+    if (isFilled) cls += ' is-filled';
+    if (count) cls += ' has-items';
+    const attrs = { class: cls, style: `flex-grow:${Math.max(effH, 1)}` };
+    let el;
+    if (interactive) {
+      el = h('button', {
+        ...attrs, type: 'button',
+        'aria-label': (zoneLabel(z) || t('kind_' + z.kind)) +
+          (mode === 'browse' ? ' · ' + tCount('items', count) : ''),
+        ...(mode === 'picker' ? { 'aria-pressed': isSel ? 'true' : 'false' } : {}),
+      });
+      if (mode === 'browse' && opts.onOpen) {
+        el.addEventListener('click', () => opts.onOpen(cell, el, root));
+      }
+      if (mode === 'picker' && opts.onPick) {
+        el.addEventListener('click', () => opts.onPick(cell));
+      }
+    } else {
+      el = h('div', attrs);
+    }
+    if (!mini) {
+      if (z.kind === 'hanging') el.appendChild(closetRailSvg());
+      if (z.kind === 'drawer') {
+        el.appendChild(h('span', { class: 'closet__handle', 'aria-hidden': 'true' }));
+      }
+      const lbl = zoneLabel(z);
+      if (lbl) el.appendChild(h('span', { class: 'closet__zlabel', dir: 'auto' }, lbl));
+      if (count) el.appendChild(h('span', { class: 'schematic__badge' }, String(count)));
+    }
+    return el;
+  }
+
+  layout.sections.forEach(sec => {
+    const { eff, rest } = closetEffHeights(sec, totalH);
+    const col = h('div', {
+      class: 'closet__col' + (sec.corner ? ' closet__col--corner' : ''),
+      style: `flex-grow:${Math.max(Number(sec.width_cm) || 1, 1)}`,
+    });
+    sec.zones.forEach((z, zi) => col.appendChild(zoneEl(z, eff[zi])));
+    if (rest > 0) {
+      col.appendChild(h('div', {
+        class: 'closet__rest', style: `flex-grow:${rest}`, 'aria-hidden': 'true',
+      }));
+    }
+    if (sec.corner && !mini) col.appendChild(closetCornerMark());
+    sectionsEl.appendChild(col);
+  });
+
+  // Width labels under the sections (blueprint chrome only).
+  if (chrome) {
+    const widths = h('div', { class: 'closet__widths', 'aria-hidden': 'true' });
+    layout.sections.forEach(sec => {
+      widths.appendChild(h('span', {
+        class: 'closet__wlabel',
+        style: `flex-grow:${Math.max(Number(sec.width_cm) || 1, 1)}`,
+      }, h('bdi', null, fmtNum(sec.width_cm) + ' ' + t('cm_short'))));
+    });
+    fig.appendChild(widths);
+  }
+  return root;
 }
 
 // status chip with icon + text (brand is green, so status never relies on green alone).
@@ -379,6 +606,111 @@ function confirmDialog(message, { confirmLabel, danger } = {}) {
     document.addEventListener('keydown', onKey);
     root.appendChild(overlay);
     dialog.querySelector('.btn--primary, .btn--danger').focus();
+  });
+}
+
+/* ============================================================ *
+ *  Inline form errors (field-level, ARIA-wired)               *
+ * ============================================================ */
+// setFieldError(input, msg): red hairline on the input, terracotta error line
+// under it, aria-invalid + aria-describedby. clearFieldError undoes it all.
+// Every form (add/edit, checkout, NFC assign, grid editor) uses this pattern.
+let fieldErrSeq = 0;
+function setFieldError(input, message) {
+  clearFieldError(input);
+  const field = input.closest('.field') || input.parentElement;
+  if (!field) return;
+  const id = 'field-err-' + (++fieldErrSeq);
+  field.classList.add('field--invalid');
+  input.setAttribute('aria-invalid', 'true');
+  input.setAttribute('aria-describedby', id);
+  field.appendChild(h('p', { class: 'field__error', id, role: 'alert' }, message));
+}
+function clearFieldError(input) {
+  const field = input.closest('.field') || input.parentElement;
+  if (!field) return;
+  const err = field.querySelector('.field__error');
+  if (err) err.remove();
+  field.classList.remove('field--invalid');
+  input.removeAttribute('aria-invalid');
+  input.removeAttribute('aria-describedby');
+}
+// Bring the offending field into view and focus it (reduced-motion aware).
+function focusFieldError(input) {
+  try {
+    input.scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth', block: 'center' });
+  } catch (_) {}
+  input.focus({ preventScroll: true });
+}
+
+/* ============================================================ *
+ *  Warm line-art illustrations (empty states, placeholders)   *
+ * ============================================================ */
+// Hand-drawn-feel stroke SVGs, 1.5px, ink + sage (+ a rare terracotta spark).
+// Colors come from CSS classes (var() is invalid in SVG presentation attrs).
+const ILLOS = {
+  // paper sheet + magnifier — search / no results
+  search: `<svg viewBox="0 0 140 100" xmlns="http://www.w3.org/2000/svg">
+    <g class="illo-ink"><rect x="34" y="12" width="52" height="66" rx="5"/>
+      <path d="M44 27h28M44 37h32M44 47h20M44 57h26"/></g>
+    <g class="illo-sage"><circle cx="93" cy="62" r="14"/><path d="M104 73l13 13"/></g>
+    <g class="illo-terra"><path d="M24 25v8M20 29h8"/><circle cx="112" cy="24" r="1.8"/></g>
+  </svg>`,
+  // open carton — items / not found
+  box: `<svg viewBox="0 0 140 100" xmlns="http://www.w3.org/2000/svg">
+    <g class="illo-ink"><path d="M38 46l32-14 32 14-32 14z"/>
+      <path d="M38 46v24l32 14 32-14V46"/><path d="M70 60v24"/>
+      <path d="M38 46l-13-8 32-14 13 8"/><path d="M102 46l13-8-32-14-13 8"/></g>
+    <g class="illo-sage"><path d="M70 22V10M59 16l-6-8M81 16l6-8"/></g>
+  </svg>`,
+  // doorway + little plant — rooms
+  room: `<svg viewBox="0 0 140 100" xmlns="http://www.w3.org/2000/svg">
+    <g class="illo-ink"><path d="M48 86V32a22 22 0 0 1 44 0v54"/>
+      <path d="M34 86h72"/><circle cx="84" cy="58" r="2.2"/></g>
+    <g class="illo-sage"><path d="M112 86V74"/>
+      <path d="M112 76c-6-2-9-8-9-13 6 0 11 5 9 13z"/>
+      <path d="M112 78c6-2 9-8 9-13-6 0-11 5-9 13z"/></g>
+  </svg>`,
+  // box with exchange arrows — borrowed
+  hand: `<svg viewBox="0 0 140 100" xmlns="http://www.w3.org/2000/svg">
+    <g class="illo-ink"><rect x="52" y="37" width="36" height="28" rx="4"/><path d="M52 47h36"/></g>
+    <g class="illo-sage"><path d="M40 28a40 28 0 0 1 61-3"/><path d="M101 15v10h-10"/>
+      <path d="M100 74a40 28 0 0 1-61 3"/><path d="M39 87V77h10"/></g>
+  </svg>`,
+  // tag card + radio waves — NFC
+  nfc: `<svg viewBox="0 0 140 100" xmlns="http://www.w3.org/2000/svg">
+    <g class="illo-ink"><rect x="38" y="24" width="46" height="54" rx="9"/><circle cx="61" cy="51" r="5"/></g>
+    <g class="illo-sage"><path d="M96 38a25 25 0 0 1 0 26"/><path d="M105 30a37 37 0 0 1 0 42"/></g>
+    <g class="illo-terra"><circle cx="30" cy="18" r="1.8"/></g>
+  </svg>`,
+  // little house — first run
+  house: `<svg viewBox="0 0 140 100" xmlns="http://www.w3.org/2000/svg">
+    <g class="illo-ink"><path d="M32 54 70 24l38 30"/><path d="M42 48v38h56V48"/>
+      <path d="M62 86V66h16v20"/></g>
+    <g class="illo-terra"><circle cx="70" cy="46" r="3"/></g>
+    <g class="illo-sage"><path d="M18 86h14M108 86h14"/></g>
+  </svg>`,
+  // pigeon-hole with one sage compartment — units / grids
+  grid: `<svg viewBox="0 0 140 100" xmlns="http://www.w3.org/2000/svg">
+    <g class="illo-ink"><rect x="38" y="22" width="64" height="58" rx="4"/>
+      <path d="M38 41h64M38 61h64M59 22v58M81 22v58"/></g>
+    <g class="illo-sage"><rect x="63" y="46" width="14" height="11" rx="2"/></g>
+    <g class="illo-terra"><path d="M112 18v7M108.5 21.5h7"/></g>
+  </svg>`,
+  // wardrobe: rail + hanger on the left, drawers on the right — closets
+  closet: `<svg viewBox="0 0 140 100" xmlns="http://www.w3.org/2000/svg">
+    <g class="illo-ink"><rect x="40" y="12" width="60" height="74" rx="3"/>
+      <path d="M70 12v74"/><path d="M70 38h30M70 54h30M70 70h30"/>
+      <path d="M82 46h6M82 62h6M82 78h6"/>
+      <path d="M46 86v5M94 86v5"/><path d="M40 70h30"/></g>
+    <g class="illo-sage"><path d="M46 26h18"/><path d="M55 26v3l-5 7h10l-5-7"/></g>
+    <g class="illo-terra"><path d="M114 22v8M110 26h8"/><circle cx="28" cy="18" r="1.8"/></g>
+  </svg>`,
+};
+function illoEl(name, cls) {
+  return h('div', {
+    class: cls || 'empty__illo', 'aria-hidden': 'true',
+    html: ILLOS[name] || ILLOS.box,
   });
 }
 
@@ -544,7 +876,6 @@ function skeletonCards(n = 6) {
       h('div', { class: 'card__body' },
         h('div', { class: 'skel skel--line skel--w70' }),
         h('div', { class: 'skel skel--line skel--w50' })),
-      h('div', { class: 'card__map skel' }),
     ));
   }
   return wrap;
@@ -589,6 +920,8 @@ function thumbEl(item) {
   return h('div', { class: 'card__thumb card__thumb--ph', 'aria-hidden': 'true' }, iconEl(ICONS.box));
 }
 
+// Photography-first card: full-bleed photo on top, name + breadcrumb below.
+// Renders in a 2-col grid on mobile (auto-fill on wider screens).
 function itemCard(item, matches) {
   const card = h('a', { class: 'card', href: '#/item/' + item.id });
   card.appendChild(thumbEl(item));
@@ -608,8 +941,6 @@ function itemCard(item, matches) {
   body.appendChild(breadcrumb(item));
   if (item.status && item.status !== 'in_stock') body.appendChild(statusChip(item.status));
   card.appendChild(body);
-
-  card.appendChild(h('div', { class: 'card__map' }, miniMap(item)));
   return card;
 }
 
@@ -626,6 +957,11 @@ function screenHome() {
   const wrap = h('div', { class: 'screen screen--home' });
 
   const hero = h('section', { class: 'hero' });
+  // Serif hero line — the magazine masthead. (With 0 items the first-run
+  // hero below carries the tagline instead, so skip it here.)
+  if (state.items.length) {
+    hero.appendChild(h('h1', { class: 'hero__title' }, t('tagline')));
+  }
   const combo = h('div', {
     class: 'searchbox', role: 'combobox', 'aria-expanded': 'false',
     'aria-haspopup': 'listbox', 'aria-owns': 'search-results',
@@ -673,7 +1009,7 @@ function screenHome() {
     const placeHits = runPlaceSearch(nq).slice(0, 4);
     if (!hits.length && !placeHits.length) {
       results.appendChild(emptyState({
-        icon: ICONS.search, title: t('no_results_title'), sub: t('no_results_sub'),
+        illo: 'search', title: t('no_results_title'), sub: t('no_results_sub'),
         actionLabel: t('add_item'), action: () => { location.hash = '#/add'; },
       }));
       announce(t('results_none'));
@@ -741,9 +1077,9 @@ function renderRecent(container) {
 function firstRunHero() {
   const root = h('div', { class: 'firstrun' });
 
-  // Hero: package icon + app name + tagline.
+  // Hero: warm line-art house + app name + tagline.
   root.appendChild(h('div', { class: 'firstrun__hero' },
-    h('div', { class: 'firstrun__badge', 'aria-hidden': 'true' }, iconEl(ICONS.box, 'firstrun__icon')),
+    illoEl('house', 'firstrun__illo'),
     h('h2', { class: 'firstrun__title' }, t('app_name')),
     h('p', { class: 'firstrun__tagline' }, t('tagline')),
   ));
@@ -935,7 +1271,7 @@ async function nfcQuickScan(tagId) {
 /* ============================================================ *
  *  Empty state                                                *
  * ============================================================ */
-function emptyState({ icon, title, sub, actionLabel, action, actionHref, actionIcon }) {
+function emptyState({ icon, illo, title, sub, actionLabel, action, actionHref, actionIcon }) {
   let actionEl = null;
   if (actionLabel) {
     const kids = [actionIcon ? iconEl(actionIcon) : null, h('span', null, actionLabel)];
@@ -943,8 +1279,12 @@ function emptyState({ icon, title, sub, actionLabel, action, actionHref, actionI
       ? h('a', { class: 'btn btn--primary', href: actionHref }, kids)
       : h('button', { class: 'btn btn--primary', type: 'button', onclick: action }, kids);
   }
+  // Warm line-art illustration when one is named; icon badge as fallback.
+  const art = illo
+    ? illoEl(illo)
+    : h('div', { class: 'empty__badge', 'aria-hidden': 'true' }, iconEl(icon || ICONS.box, 'empty__icon'));
   return h('div', { class: 'empty' },
-    h('div', { class: 'empty__badge', 'aria-hidden': 'true' }, iconEl(icon || ICONS.box, 'empty__icon')),
+    art,
     h('p', { class: 'empty__title' }, title),
     sub ? h('p', { class: 'empty__sub' }, sub) : null,
     actionEl,
@@ -959,7 +1299,7 @@ function screenBrowse() {
   wrap.appendChild(pageHead(t('browse')));
   if (!state.rooms.length) {
     wrap.appendChild(emptyState({
-      icon: ICONS.room, title: t('no_rooms'), sub: t('no_rooms_sub'),
+      illo: 'room', title: t('no_rooms'), sub: t('no_rooms_sub'),
       actionLabel: t('add_first_item_cta'), actionHref: '#/add', actionIcon: ICONS.plus,
     }));
     return wrap;
@@ -980,24 +1320,61 @@ function screenBrowse() {
 function screenBrowseRoom(roomId) {
   const room = state.roomById.get(roomId);
   const wrap = h('div', { class: 'screen' });
-  if (!room) { wrap.appendChild(emptyState({ icon: ICONS.room, title: t('no_rooms') })); return wrap; }
+  if (!room) { wrap.appendChild(emptyState({ illo: 'room', title: t('no_rooms') })); return wrap; }
   wrap.appendChild(pageHead(localName(room), '#/browse'));
   const units = state.units.filter(u => u.room_id === roomId).sort((a, b) => a.sort_order - b.sort_order);
-  if (!units.length) { wrap.appendChild(emptyState({ icon: ICONS.box, title: t('no_units') })); return wrap; }
+  if (!units.length) { wrap.appendChild(emptyState({ illo: 'grid', title: t('no_units') })); return wrap; }
   const grid = h('div', { class: 'tilegrid' });
   units.forEach(unit => {
-    // For grid units show the door-compartment count; for plain units show item count.
-    const meta = (unit.grid_rows && unit.grid_cols)
+    // Grid/closet units show the trackable-compartment count; plain units the item count.
+    const lay = unitLayout(unit);
+    const meta = (lay === 'grid' || lay === 'closet')
       ? tCount('compartments', countDoorCells(unit.id))
       : tCount('items', countItemsInUnit(unit.id));
     grid.appendChild(h('a', { class: 'tile', href: '#/browse/unit/' + unit.id },
-      iconEl(ICONS.box, 'tile__icon'),
+      h('span', { class: 'tile__mini' }, unitMiniature(unit)),
       h('span', { class: 'tile__name' }, localName(unit)),
       h('span', { class: 'tile__meta' }, meta),
     ));
   });
   wrap.appendChild(grid);
   return wrap;
+}
+
+// Live miniature of a unit's schematic for its browse tile: door cells as
+// paper squares (sage-filled when something is stored there), open cells
+// hatched. Falls back to the box icon for grid-less units.
+function unitMiniature(unit) {
+  if (unitLayout(unit) === 'closet') {
+    const filled = new Set();
+    state.items.forEach(it => (it.locations || []).forEach(l => {
+      if (l.unit_id === unit.id && l.cell_id != null) filled.add(l.cell_id);
+    }));
+    const m = closetSchematic(closetLayoutOf(unit), { mode: 'mini', filledCellIds: filled });
+    m.setAttribute('aria-hidden', 'true');
+    return m;
+  }
+  if (!unit.grid_rows || !unit.grid_cols) return iconEl(ICONS.box, 'tile__icon');
+  const grid = h('div', {
+    class: 'minimap minimap--tile', 'aria-hidden': 'true',
+    style: `--rows:${unit.grid_rows};--cols:${unit.grid_cols}`,
+  });
+  const byRC = new Map(state.cells.filter(c => c.unit_id === unit.id)
+    .map(c => [c.row + ':' + c.col, c]));
+  const filled = new Set();
+  state.items.forEach(it => (it.locations || []).forEach(l => {
+    if (l.unit_id === unit.id && l.cell_id != null) filled.add(l.cell_id);
+  }));
+  for (let r = 0; r < unit.grid_rows; r++) {
+    for (let c = 0; c < unit.grid_cols; c++) {
+      const cell = byRC.get(r + ':' + c);
+      let cls = 'minimap__cell';
+      if (cell && !isDoorCell(cell)) cls += ' minimap__cell--open';
+      else if (cell && filled.has(cell.id)) cls += ' minimap__cell--filled';
+      grid.appendChild(h('span', { class: cls }));
+    }
+  }
+  return grid;
 }
 
 function countItemsInUnit(unitId) {
@@ -1040,16 +1417,23 @@ function schematicLegend() {
 function screenBrowseUnit(unitId, opts = {}) {
   const unit = state.unitById.get(unitId);
   const wrap = h('div', { class: 'screen' });
-  if (!unit) { wrap.appendChild(emptyState({ icon: ICONS.box, title: t('no_units') })); return wrap; }
+  if (!unit) { wrap.appendChild(emptyState({ illo: 'grid', title: t('no_units') })); return wrap; }
   const room = state.roomById.get(unit.room_id);
+  const lay = unitLayout(unit);
   const head = pageHead(localName(unit), room ? '#/browse/room/' + room.id : '#/browse');
-  head.appendChild(h('a', {
-    class: 'btn btn--ghost btn--sm', href: '#/unit/' + unit.id + '/grid',
-  }, t('edit_grid')));
+  if (lay === 'closet') {
+    head.appendChild(h('a', {
+      class: 'btn btn--ghost btn--sm', href: '#/unit/' + unit.id + '/closet',
+    }, t('edit_closet')));
+  } else if (lay === 'grid') {
+    head.appendChild(h('a', {
+      class: 'btn btn--ghost btn--sm', href: '#/unit/' + unit.id + '/grid',
+    }, t('edit_grid')));
+  }
   wrap.appendChild(head);
 
-  // Door-compartment count for grid units.
-  if (unit.grid_rows && unit.grid_cols) {
+  // Trackable-compartment count for mapped units.
+  if (lay === 'grid' || lay === 'closet') {
     wrap.appendChild(h('p', { class: 'hint hint--count' }, tCount('compartments', countDoorCells(unit.id))));
   }
 
@@ -1063,7 +1447,23 @@ function screenBrowseUnit(unitId, opts = {}) {
 
   const detailHost = h('div', { class: 'cell-detail', id: 'cell-detail' });
 
-  if (unit.grid_rows && unit.grid_cols) {
+  if (lay === 'closet') {
+    // To-scale closet blueprint; trackable zones open the same contents sheet
+    // grid door cells use (identical ?cell= highlight/auto-open plumbing).
+    const renderer = closetSchematic(closetLayoutOf(unit), {
+      mode: 'browse', unit,
+      highlightCellId: opts.highlightCellId != null ? opts.highlightCellId : null,
+      onOpen: (cell, btn, rootEl) => showCellItems(unit, cell, detailHost, rootEl, btn),
+    });
+    wrap.appendChild(renderer);
+    wrap.appendChild(h('p', { class: 'hint' }, t('tap_zone')));
+    wrap.appendChild(detailHost);
+    if (opts.highlightCellId != null) {
+      const cell = state.cellById.get(opts.highlightCellId);
+      const btn = renderer.querySelector('button.is-hit');
+      if (cell && isDoorCell(cell) && btn) showCellItems(unit, cell, detailHost, renderer, btn);
+    }
+  } else if (unit.grid_rows && unit.grid_cols) {
     const cellsOfUnit = state.cells.filter(c => c.unit_id === unit.id);
     const byRC = new Map(cellsOfUnit.map(c => [c.row + ':' + c.col, c]));
     const grid = h('div', {
@@ -1118,8 +1518,14 @@ function screenBrowseUnit(unitId, opts = {}) {
       if (cell && isDoorCell(cell) && btn) showCellItems(unit, cell, detailHost, grid, btn);
     }
   } else {
-    // No grid -> just list items directly under the unit.
-    wrap.appendChild(h('p', { class: 'hint' }, t('no_cells')));
+    // No layout yet -> invite mapping it as a closet (grid stays available).
+    wrap.appendChild(emptyState({
+      illo: 'closet', title: t('map_closet_title'), sub: t('map_closet_sub'),
+      actionLabel: t('map_closet_cta'), actionHref: '#/unit/' + unit.id + '/closet',
+    }));
+    wrap.appendChild(h('div', { class: 'center-row' },
+      h('a', { class: 'btn btn--ghost btn--sm', href: '#/unit/' + unit.id + '/grid' },
+        t('or_use_grid'))));
   }
 
   // Items with no specific cell in this unit.
@@ -1129,14 +1535,13 @@ function screenBrowseUnit(unitId, opts = {}) {
     const cards = h('div', { class: 'cards' });
     loose.forEach(it => cards.appendChild(itemCard(it)));
     wrap.appendChild(cards);
-  } else if (!unit.grid_rows) {
-    wrap.appendChild(emptyState({ icon: ICONS.box, title: t('no_items_here') }));
   }
   return wrap;
 }
 
 function showCellItems(unit, cell, host, grid, btn) {
-  grid.querySelectorAll('.schematic__cell').forEach(b => b.classList.remove('is-selected'));
+  grid.querySelectorAll('.schematic__cell, .closet__zone')
+    .forEach(b => b.classList.remove('is-selected'));
   btn.classList.add('is-selected');
   clear(host);
   const items = itemsInCell(unit.id, cell.id);
@@ -1169,7 +1574,7 @@ function showCellItems(unit, cell, host, grid, btn) {
 async function screenItem(itemId, opts = {}) {
   const wrap = h('div', { class: 'screen screen--item' });
   // Skeleton while we fetch the full item (with open borrow + photo url).
-  wrap.appendChild(pageHead(t('item')));
+  wrap.appendChild(pageHead(t('item'), '#/'));
   const body = h('div', { class: 'item-detail' }, skeletonCards(1));
   wrap.appendChild(body);
 
@@ -1178,7 +1583,7 @@ async function screenItem(itemId, opts = {}) {
     item = await apiGet('items/' + itemId);
   } catch (e) {
     clear(body);
-    body.appendChild(emptyState({ icon: ICONS.box, title: t('item_not_found') }));
+    body.appendChild(emptyState({ illo: 'box', title: t('item_not_found') }));
     return wrap;
   }
   // Keep local cache fresh.
@@ -1197,24 +1602,30 @@ async function screenItem(itemId, opts = {}) {
       if (el) undoHost.appendChild(el);
     });
   }
-  // Photo (lazy full image).
+  // Photo (lazy full image) — or a tasteful line-art placeholder plate.
   if (item.photo_url) {
     body.appendChild(h('div', { class: 'item-detail__photo' },
       h('img', {
         class: 'item-detail__img', loading: 'lazy', decoding: 'async', alt: itemName(item),
         src: new URL(item.photo_url, document.baseURI).href,
       })));
+  } else {
+    body.appendChild(illoEl('box', 'item-detail__photo item-detail__photo--ph'));
   }
 
-  // Names (each user field dir="auto"; brand/number wrapped in <bdi>).
+  // Kicker: brand · category as letter-spaced small caps (museum-label meta).
+  if (item.brand || item.category) {
+    const kick = h('p', { class: 'item-detail__kicker meta-caps' });
+    if (item.brand) kick.appendChild(h('bdi', null, item.brand));
+    if (item.brand && item.category) kick.appendChild(document.createTextNode(' · '));
+    if (item.category) kick.appendChild(h('span', { dir: 'auto' }, item.category));
+    body.appendChild(kick);
+  }
+
+  // Names (each user field dir="auto"; brand lives in the kicker above).
   const titleBlock = h('div', { class: 'item-detail__titles' });
   const main = h('h1', { class: 'item-detail__name', dir: 'auto' });
   main.textContent = itemName(item);
-  if (item.brand) {
-    main.appendChild(document.createTextNode(' '));
-    const b = document.createElement('bdi'); b.className = 'item-detail__brand'; b.textContent = item.brand;
-    main.appendChild(b);
-  }
   titleBlock.appendChild(main);
   // alternate-language names
   ['name_en', 'name_fa', 'name_da'].forEach(key => {
@@ -1229,20 +1640,10 @@ async function screenItem(itemId, opts = {}) {
   body.appendChild(titleBlock);
 
   body.appendChild(statusChip(item.status));
-  body.appendChild(breadcrumb(item));
 
-  // Mini-map of the unit with the item's cell highlighted (degrades to chip).
-  body.appendChild(h('div', { class: 'item-detail__map' }, miniMap(item)));
-
-  // "Show on map" — jump to the unit schematic with this item's cell
-  // highlighted + auto-opened (via the existing #/browse/unit/<id>?cell= plumbing).
-  const pl = primaryLocation(item);
-  if (pl && pl.unit && pl.cell) {
-    body.appendChild(h('a', {
-      class: 'btn btn--ghost btn--sm item-detail__showmap',
-      href: '#/browse/unit/' + pl.unit.id + '?cell=' + pl.cell.id,
-    }, iconEl(ICONS.grid), h('span', null, t('show_on_map'))));
-  }
+  // Location plate: mini-map + visual breadcrumb + "show on map" in one
+  // bordered paper card (the museum "where to find it" panel).
+  body.appendChild(locationCard(item));
 
   // Meta rows
   const meta = h('dl', { class: 'metalist' });
@@ -1253,7 +1654,6 @@ async function screenItem(itemId, opts = {}) {
     dd.textContent = value;
     meta.appendChild(dd);
   };
-  addMeta(t('category'), item.category, 'auto');
   addMeta(t('quantity'), String(item.qty));
   if (item.tags && item.tags.length) {
     meta.appendChild(h('dt', null, t('tags')));
@@ -1287,6 +1687,29 @@ async function screenItem(itemId, opts = {}) {
   );
   body.appendChild(actions);
   return wrap;
+}
+
+// Location plate for the item page: mini-map beside the breadcrumb and the
+// "show on map" jump (deep-links into the unit schematic with the cell open).
+function locationCard(item) {
+  const pl = primaryLocation(item);
+  const card = h('div', { class: 'loccard' });
+  if (!pl || !pl.unit) {
+    card.appendChild(h('p', { class: 'breadcrumb breadcrumb--empty' }, t('no_location')));
+    return card;
+  }
+  card.appendChild(h('div', { class: 'loccard__map' }, miniMap(item)));
+  const bodyEl = h('div', { class: 'loccard__body' },
+    h('span', { class: 'meta-caps' }, t('location')),
+    breadcrumb(item));
+  if (pl.cell) {
+    bodyEl.appendChild(h('a', {
+      class: 'btn btn--ghost btn--sm item-detail__showmap',
+      href: '#/browse/unit/' + pl.unit.id + '?cell=' + pl.cell.id,
+    }, iconEl(ICONS.grid), h('span', null, t('show_on_map'))));
+  }
+  card.appendChild(bodyEl);
+  return card;
 }
 
 function borrowPanel(item) {
@@ -1362,8 +1785,9 @@ function openCheckout(item) {
   const close = () => { if (overlay.parentNode) root.removeChild(overlay); };
   const form = h('form', { class: 'modal modal--form', role: 'dialog', 'aria-modal': 'true' });
   form.appendChild(h('h2', { class: 'modal__title' }, t('checkout_title')));
-  const whoInput = h('input', { class: 'input', type: 'text', required: true,
+  const whoInput = h('input', { class: 'input', type: 'text',
     placeholder: t('borrowed_by_ph'), 'aria-label': t('borrowed_by'), dir: 'auto' });
+  whoInput.addEventListener('input', () => clearFieldError(whoInput));
   const dueInput = h('input', { class: 'input', type: 'date', 'aria-label': t('due_date') });
   form.appendChild(h('label', { class: 'field' },
     h('span', { class: 'field__label' }, t('borrowed_by')), whoInput));
@@ -1376,7 +1800,11 @@ function openCheckout(item) {
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const who = whoInput.value.trim();
-    if (!who) { whoInput.focus(); return; }
+    if (!who) {
+      setFieldError(whoInput, t('err_borrower_required'));
+      focusFieldError(whoInput);
+      return;
+    }
     close();
     await doCheckout(item, who, dueInput.value || null);
   });
@@ -1545,7 +1973,7 @@ async function screenAddEdit(itemId, preselect) {
     if (!model) {
       try { model = await apiGet('items/' + itemId); } catch (_) { model = null; }
     }
-    if (!model) { wrap.appendChild(emptyState({ icon: ICONS.box, title: t('item_not_found') })); return wrap; }
+    if (!model) { wrap.appendChild(emptyState({ illo: 'box', title: t('item_not_found') })); return wrap; }
     model.tags = model.tags || [];
   } else {
     model = blankItem();
@@ -1585,8 +2013,6 @@ async function screenAddEdit(itemId, preselect) {
       h('button', { class: 'btn btn--ghost', type: 'button',
         onclick: () => fileInput.click() }, iconEl(ICONS.camera),
         h('span', null, photoState.url || photoState.file ? t('replace_photo') : t('take_photo'))),
-      h('button', { class: 'btn btn--ghost', type: 'button', onclick: () => scanInto(model, form) },
-        iconEl(ICONS.box), h('span', null, t('scan_barcode'))),
       (photoState.url || photoState.file) ? h('button', {
         class: 'btn btn--danger-ghost', type: 'button',
         onclick: () => { photoState.file = null; photoState.url = null; model.photo_removed = true; renderPhoto(); },
@@ -1595,6 +2021,79 @@ async function screenAddEdit(itemId, preselect) {
   );
   form.appendChild(fileInput);
   form.appendChild(captureRow);
+
+  // --- Barcode: a VISIBLE, editable field with an inline scan button. ---
+  // Scanned values show a sage "Scanned" chip; the Open Food Facts lookup
+  // reports its progress inline right under the field (never dead air).
+  const bcInput = h('input', {
+    class: 'input mono codefield__input', type: 'text', value: model.barcode || '',
+    dir: 'ltr', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false',
+    placeholder: t('barcode_ph'), 'aria-label': t('barcode'),
+  });
+  const bcScan = h('button', { class: 'btn btn--ghost codefield__scan', type: 'button' },
+    iconEl(ICONS.camera), h('span', null, t('scan_barcode')));
+  const bcChip = h('span', { class: 'chip chip--scanned', hidden: true },
+    iconEl(ICONS.check), h('span', null, t('barcode_scanned')));
+  const bcStatus = h('span', { class: 'lookup-status', hidden: true });
+  const bcField = h('div', { class: 'field' },
+    h('span', { class: 'field__label' }, t('barcode')),
+    h('div', { class: 'codefield' }, bcInput, bcScan),
+    h('div', { class: 'codefield__meta' }, bcChip, bcStatus),
+  );
+  form.appendChild(bcField);
+
+  // Best-effort product lookup with inline status. A sequence counter drops
+  // stale responses (rescan / manual edit while a lookup is in flight).
+  let lookupSeq = 0;
+  async function runLookup(rawCode) {
+    const seq = ++lookupSeq;
+    bcStatus.hidden = false;
+    bcStatus.className = 'lookup-status lookup-status--busy';
+    clear(bcStatus);
+    bcStatus.appendChild(h('span', { class: 'lookup-status__spin', 'aria-hidden': 'true' }));
+    bcStatus.appendChild(h('span', null, t('looking_up')));
+    announce(t('looking_up'));
+    let data = null;
+    try { data = await apiGet('lookup/' + encodeURIComponent(normalizeBarcode(rawCode))); }
+    catch (_) { data = null; /* offline / proxy failure -> same as a miss */ }
+    if (seq !== lookupSeq) return; // superseded
+    clear(bcStatus);
+    if (data && (data.name || data.brand)) {
+      if (data.name && !fEn.input.value) { fEn.input.value = data.name; clearFieldError(fEn.input); }
+      if (data.brand && !fBrand.input.value) fBrand.input.value = data.brand;
+      const nm = data.name || data.brand;
+      bcStatus.className = 'lookup-status lookup-status--found';
+      bcStatus.appendChild(iconEl(ICONS.check));
+      bcStatus.appendChild(h('span', null, t('lookup_found_pre') + ' '));
+      bcStatus.appendChild(h('bdi', null, nm));
+      bcStatus.appendChild(h('span', null, ' — ' + t('lookup_found_post')));
+      announce(t('lookup_found_pre') + ' ' + nm + ' — ' + t('lookup_found_post'));
+    } else {
+      bcStatus.className = 'lookup-status lookup-status--miss';
+      bcStatus.appendChild(h('span', null, t('lookup_miss')));
+      announce(t('lookup_miss'));
+    }
+  }
+
+  bcScan.addEventListener('click', async () => {
+    const result = await openScanner();
+    if (!result) return;
+    const code = normalizeBarcode(result.rawValue);
+    bcInput.value = code;
+    model.barcode = code;
+    model.barcode_format = result.format || null;
+    bcChip.hidden = false;
+    runLookup(code);
+  });
+  bcInput.addEventListener('input', () => {
+    // Hand-edited: it's no longer the scanned value — drop format + chip,
+    // and cancel any in-flight lookup so it can't overwrite fields later.
+    model.barcode = bcInput.value.trim();
+    model.barcode_format = null;
+    bcChip.hidden = true;
+    bcStatus.hidden = true;
+    lookupSeq++;
+  });
 
   // --- Name fields (all three languages) ---
   const fieldText = (key, label, opts = {}) => {
@@ -1606,6 +2105,10 @@ async function screenAddEdit(itemId, preselect) {
   const fEn = fieldText('name_en', t('name_en'), { lang: 'en' });
   const fFa = fieldText('name_fa', t('name_fa'), { lang: 'fa' });
   const fDa = fieldText('name_da', t('name_da'), { lang: 'da' });
+  // Any of the three names satisfies the "give it a name" rule — typing in any
+  // of them clears the inline error shown under the English name field.
+  [fEn, fFa, fDa].forEach(f =>
+    f.input.addEventListener('input', () => clearFieldError(fEn.input)));
   const fBrand = fieldText('brand', t('brand'));
   const fCat = fieldText('category', t('category'), { ph: t('category_ph') });
   const fTags = fieldText('_tags', t('tags'), { ph: t('tags_ph') });
@@ -1657,10 +2160,6 @@ async function screenAddEdit(itemId, preselect) {
 
   form.appendChild(fNotes.wrap);
 
-  // store refs so scanInto can autofill
-  form._fields = { fEn, fBrand };
-  form._model = model;
-
   // --- Actions ---
   const submitBtn = h('button', { class: 'btn btn--primary btn--block', type: 'submit' },
     isEdit ? t('save') : t('add_item'));
@@ -1670,6 +2169,7 @@ async function screenAddEdit(itemId, preselect) {
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
+    const bcVal = normalizeBarcode(bcInput.value.trim());
     const payload = {
       name_en: fEn.input.value.trim(),
       name_fa: fFa.input.value.trim(),
@@ -1678,8 +2178,8 @@ async function screenAddEdit(itemId, preselect) {
       category: fCat.input.value.trim(),
       qty: parseInt(fQty.input.value, 10) || 0,
       tags: fTags.input.value.split(',').map(s => s.trim()).filter(Boolean),
-      barcode: model.barcode || null,
-      barcode_format: model.barcode_format || null,
+      barcode: bcVal || null,
+      barcode_format: (bcVal && model.barcode_format) || null,
       notes: fNotes.input.value.trim(),
       locations: locPicker.getLocations(),
     };
@@ -1689,8 +2189,12 @@ async function screenAddEdit(itemId, preselect) {
     // 'in_stock' item. The server PATCH only updates provided keys.
     if (statusSel && statusSel.value !== model.status) payload.status = statusSel.value;
     if (!payload.name_en && !payload.name_fa && !payload.name_da) {
+      // Inline field-level error (primary) + toast (secondary). The rule is
+      // client-side by design: the server accepts nameless items, but an
+      // unnamed item is unfindable, so the form insists on one name.
+      setFieldError(fEn.input, t('err_name_required'));
       toast(t('name_required'), { kind: 'error' });
-      fEn.input.focus();
+      focusFieldError(fEn.input);
       return;
     }
     submitBtn.disabled = true; submitBtn.textContent = t('saving');
@@ -1722,31 +2226,14 @@ async function screenAddEdit(itemId, preselect) {
 
   wrap.appendChild(form);
 
-  // Camera-first: if adding fresh, offer scan immediately (non-blocking).
-  return wrap;
-}
-
-async function scanInto(model, form) {
-  const result = await openScanner();
-  if (!result) return;
-  const code = result.rawValue;
-  model.barcode = code;
-  model.barcode_format = result.format;
-  // best-effort lookup to autofill brand/name
-  const dismiss = toast(t('looking_up'), { duration: 4000 });
-  try {
-    const norm = normalizeBarcode(code);
-    const data = await apiGet('lookup/' + encodeURIComponent(norm));
-    if (data && (data.name || data.brand)) {
-      if (data.name && form._fields && !form._fields.fEn.input.value) form._fields.fEn.input.value = data.name;
-      if (data.brand && form._fields && !form._fields.fBrand.input.value) form._fields.fBrand.input.value = data.brand;
-      toast(t('lookup_found'));
-    } else {
-      toast(t('lookup_none'));
-    }
-  } catch (_) {
-    toast(t('lookup_none'));
+  // Arrived via #/add?barcode=<code> (home-screen scan with no owner): the
+  // code IS from a scan — show the chip and run the product lookup right
+  // away so the user sees the barcode working, not a silently blank form.
+  if (!isEdit && model.barcode) {
+    bcChip.hidden = false;
+    setTimeout(() => runLookup(model.barcode), 0);
   }
+  return wrap;
 }
 
 function buildLocationPicker(model, preselect) {
@@ -1772,6 +2259,27 @@ function buildLocationPicker(model, preselect) {
 
   const unitSel = h('select', { class: 'input', 'aria-label': t('pick_unit') });
   const cellSel = h('select', { class: 'input', 'aria-label': t('pick_cell') });
+  const zoneHost = h('div', { class: 'locpicker__zones' });
+  // Closet units pick their zone on the schematic instead of a dropdown.
+  let zoneCellId = existing && existing.cell_id != null ? existing.cell_id : null;
+
+  function renderZonePick() {
+    clear(zoneHost);
+    const uid = parseInt(unitSel.value, 10);
+    const unit = state.unitById.get(uid);
+    if (!unit || unitLayout(unit) !== 'closet') return;
+    zoneHost.appendChild(h('p', { class: 'hint' }, t('pick_zone_hint')));
+    zoneHost.appendChild(closetSchematic(closetLayoutOf(unit), {
+      mode: 'picker', selectedCellId: zoneCellId,
+      onPick: (cell) => {
+        zoneCellId = zoneCellId === cell.id ? null : cell.id;
+        renderZonePick();
+      },
+    }));
+    const selCell = zoneCellId != null ? state.cellById.get(zoneCellId) : null;
+    zoneHost.appendChild(h('p', { class: 'hint hint--count' },
+      selCell ? (cellLabel(selCell) || t('cell')) : t('no_cell')));
+  }
 
   function fillUnits() {
     clear(unitSel);
@@ -1786,9 +2294,22 @@ function buildLocationPicker(model, preselect) {
   }
   function fillCells() {
     clear(cellSel);
+    clear(zoneHost);
     cellSel.appendChild(h('option', { value: '' }, t('no_cell')));
     const uid = parseInt(unitSel.value, 10);
     const unit = state.unitById.get(uid);
+    // Drop a zone selection that no longer matches the picked unit.
+    if (zoneCellId != null) {
+      const zc = state.cellById.get(zoneCellId);
+      if (!zc || !unit || zc.unit_id !== unit.id) zoneCellId = null;
+    }
+    if (unit && unitLayout(unit) === 'closet') {
+      cellSel.hidden = true;
+      cellSel.disabled = true;
+      renderZonePick();
+      return;
+    }
+    cellSel.hidden = false;
     if (!unit || !unit.grid_rows) { cellSel.disabled = true; return; }
     cellSel.disabled = false;
     // Only DOOR cells are assignable — open (exposed display) cells are never selectable.
@@ -1807,14 +2328,18 @@ function buildLocationPicker(model, preselect) {
   el.appendChild(roomSel);
   el.appendChild(unitSel);
   el.appendChild(cellSel);
+  el.appendChild(zoneHost);
 
   return {
     el,
     getLocations() {
       const uid = parseInt(unitSel.value, 10);
       if (!uid) return [];
-      const cid = parseInt(cellSel.value, 10);
-      return [{ unit_id: uid, cell_id: cid || null, qty_here: model.qty || 1, is_primary: 1 }];
+      const unit = state.unitById.get(uid);
+      const cid = (unit && unitLayout(unit) === 'closet')
+        ? (zoneCellId || null)
+        : (parseInt(cellSel.value, 10) || null);
+      return [{ unit_id: uid, cell_id: cid, qty_here: model.qty || 1, is_primary: 1 }];
     },
   };
 }
@@ -1825,7 +2350,12 @@ function buildLocationPicker(model, preselect) {
 async function screenGridEditor(unitId) {
   const unit = state.unitById.get(unitId);
   const wrap = h('div', { class: 'screen screen--grid' });
-  if (!unit) { wrap.appendChild(emptyState({ icon: ICONS.box, title: t('no_units') })); return wrap; }
+  if (!unit) { wrap.appendChild(emptyState({ illo: 'grid', title: t('no_units') })); return wrap; }
+  if (unitLayout(unit) === 'closet') {
+    // Closet units are edited in the composer; conversion happens there.
+    location.replace('#/unit/' + unitId + '/closet');
+    return wrap;
+  }
   wrap.appendChild(pageHead(t('grid_editor') + ' · ' + localName(unit), '#/browse/unit/' + unit.id));
   wrap.appendChild(h('p', { class: 'hint' }, t('grid_help')));
 
@@ -1855,6 +2385,8 @@ async function screenGridEditor(unitId) {
   const applyBtn = h('button', { class: 'btn btn--ghost', type: 'button' }, t('apply_grid'));
   controls.appendChild(applyBtn);
   wrap.appendChild(controls);
+  rowsInput.addEventListener('input', () => clearFieldError(rowsInput));
+  colsInput.addEventListener('input', () => clearFieldError(colsInput));
 
   // Legend + kind toggle help.
   wrap.appendChild(h('div', { class: 'grid-legend' },
@@ -1913,9 +2445,16 @@ async function screenGridEditor(unitId) {
   renderGrid();
 
   applyBtn.addEventListener('click', () => {
-    // Cap 20 matches the server clamp in api_unit_create/api_unit_update.
-    rows = Math.max(0, Math.min(20, parseInt(rowsInput.value, 10) || 0));
-    cols = Math.max(0, Math.min(20, parseInt(colsInput.value, 10) || 0));
+    // Range 0–20 matches the server clamp in api_unit_create/api_unit_update.
+    // Out-of-range values get an inline error instead of a silent clamp.
+    const rv = parseInt(rowsInput.value, 10);
+    const cv = parseInt(colsInput.value, 10);
+    const rOk = Number.isInteger(rv) && rv >= 0 && rv <= 20;
+    const cOk = Number.isInteger(cv) && cv >= 0 && cv <= 20;
+    if (!rOk) setFieldError(rowsInput, t('err_grid_range'));
+    if (!cOk) setFieldError(colsInput, t('err_grid_range'));
+    if (!rOk || !cOk) { focusFieldError(!rOk ? rowsInput : colsInput); return; }
+    rows = rv; cols = cv;
     rowsInput.value = String(rows); colsInput.value = String(cols);
     renderGrid();
   });
@@ -1974,6 +2513,330 @@ async function screenGridEditor(unitId) {
 }
 
 /* ============================================================ *
+ *  SCREEN 5b — Closet composer (sections + zones, to-scale)   *
+ * ============================================================ */
+// Build/edit a closet layout: start from a template (or empty), tune each
+// section (width, corner) and its zones (kind, height or "Rest", label) with
+// a live to-scale preview, then save via PUT /api/units/<id>/layout (which
+// switches a 'none'/'grid' unit to 'closet'). Before saving we warn about any
+// items or NFC tags that dropped/opened zones would lose — matching exactly
+// what the server degrades (see api_unit_layout_put).
+const CLOSET_KINDS = ['shelf', 'drawer', 'hanging', 'basket', 'open'];
+
+function ccZone(kind = 'shelf') {
+  return { kind, height_cm: null, label_en: '', label_fa: '', label_da: '' };
+}
+function ccSection() {
+  return { width_cm: 50, corner: false, zones: [ccZone('shelf')] };
+}
+// Deep clone a template / layout payload into an editable working model.
+function ccClone(src) {
+  return {
+    height_cm: src.height_cm != null ? src.height_cm : 236,
+    sections: (src.sections || []).map(s => ({
+      width_cm: s.width_cm != null ? s.width_cm : 50,
+      corner: !!s.corner,
+      zones: (s.zones || []).map(z => ({
+        kind: CLOSET_KINDS.includes(z.kind) ? z.kind : 'shelf',
+        height_cm: z.height_cm != null ? z.height_cm : null,
+        label_en: z.label_en || '', label_fa: z.label_fa || '', label_da: z.label_da || '',
+      })),
+    })),
+  };
+}
+
+async function screenClosetEditor(unitId) {
+  const unit = state.unitById.get(unitId);
+  const wrap = h('div', { class: 'screen screen--closet' });
+  if (!unit) { wrap.appendChild(emptyState({ illo: 'closet', title: t('no_units') })); return wrap; }
+  const backHash = '#/browse/unit/' + unit.id;
+  const curLayout = unitLayout(unit);
+  const isGrid = curLayout === 'grid';
+  wrap.appendChild(pageHead(t('closet_editor') + ' · ' + localName(unit), backHash));
+  if (isGrid) wrap.appendChild(h('p', { class: 'hint' }, t('switch_to_closet')));
+  wrap.appendChild(h('p', { class: 'hint' }, t('closet_help')));
+
+  const host = h('div', { class: 'closet-host' });
+  wrap.appendChild(host);
+
+  // Working model + view state.
+  let model = { height_cm: unit.height_cm != null ? unit.height_cm : 236, sections: [] };
+  let picked = false;         // moved past the template picker?
+  let templates = [];
+  let errors = {};
+  let previewBody = null;
+
+  // Seed the model from an existing closet (authoritative labels/heights).
+  if (curLayout === 'closet') {
+    try {
+      const lay = await apiGet('units/' + unit.id + '/layout');
+      if (lay && (lay.sections || []).length) { model = ccClone(lay); picked = true; }
+    } catch (_) { /* fall back to the picker */ }
+  }
+  // Named starting points (best-effort; picker still offers "start empty").
+  try {
+    const res = await apiGet('units/layout_templates');
+    templates = (res && res.templates) || [];
+  } catch (_) { templates = []; }
+
+  const toLayout = () => ({ height_cm: Number(model.height_cm) || 236, sections: model.sections });
+  const localField = (obj, base) => obj[base + '_' + getLang()] || obj[base + '_en'] || '';
+
+  function redrawPreview() {
+    if (!previewBody) return;
+    clear(previewBody);
+    previewBody.appendChild(closetSchematic(toLayout(), { mode: 'preview' }));
+  }
+
+  // ----- template picker ---------------------------------------------------
+  function renderPicker() {
+    host.appendChild(h('h2', { class: 'section-title' }, t('tpl_pick_title')));
+    host.appendChild(h('p', { class: 'hint' }, t('tpl_pick_sub')));
+    const grid = h('div', { class: 'tpl-grid' });
+
+    const empty = h('button', { class: 'tpl-card tpl-card--empty', type: 'button' },
+      h('div', { class: 'tpl-card__prev' }, illoEl('closet')),
+      h('span', { class: 'tpl-card__name' }, t('tpl_empty')),
+      h('span', { class: 'tpl-card__sub' }, t('tpl_empty_sub')));
+    empty.addEventListener('click', () => {
+      model = { height_cm: 236, sections: [ccSection()] }; picked = true; render();
+    });
+    grid.appendChild(empty);
+
+    templates.forEach(tpl => {
+      const card = h('button', { class: 'tpl-card', type: 'button' },
+        h('div', { class: 'tpl-card__prev' }, closetSchematic(ccClone(tpl), { mode: 'mini' })),
+        h('span', { class: 'tpl-card__name', dir: 'auto' }, localField(tpl, 'name')),
+        h('span', { class: 'tpl-card__sub', dir: 'auto' }, localField(tpl, 'desc')));
+      card.addEventListener('click', () => { model = ccClone(tpl); picked = true; render(); });
+      grid.appendChild(card);
+    });
+    host.appendChild(grid);
+    host.appendChild(h('div', { class: 'form__actions' },
+      h('a', { class: 'btn btn--ghost', href: backHash }, t('cancel'))));
+  }
+
+  // ----- editor ------------------------------------------------------------
+  function renderEditor() {
+    const compose = h('div', { class: 'closet-compose' });
+
+    // closet height
+    const heightInput = h('input', {
+      class: 'input input--num', type: 'number', min: '50', max: '400',
+      inputmode: 'numeric', value: model.height_cm === '' ? '' : String(model.height_cm),
+    });
+    heightInput.addEventListener('input', () => {
+      clearFieldError(heightInput);
+      model.height_cm = heightInput.value === '' ? '' : Number(heightInput.value);
+      redrawPreview();
+    });
+    const heightField = h('label', { class: 'field field--num' },
+      h('span', { class: 'field__label' }, t('closet_height')), heightInput);
+    if (errors.height) setFieldError(heightInput, errors.height);
+    compose.appendChild(heightField);
+
+    // live to-scale preview
+    previewBody = h('div', { class: 'closet-preview__body' });
+    compose.appendChild(h('div', { class: 'closet-preview' },
+      h('span', { class: 'closet-preview__label' }, t('preview')), previewBody));
+    redrawPreview();
+
+    // sections
+    const secWrap = h('div', { class: 'closet-secs' });
+    model.sections.forEach((sec, i) => secWrap.appendChild(sectionCard(sec, i)));
+    compose.appendChild(secWrap);
+    if (errors.sections) compose.appendChild(
+      h('p', { class: 'field__error', role: 'alert' }, errors.sections));
+
+    if (model.sections.length < 8) {
+      const addSec = h('button', { class: 'btn btn--ghost btn--block', type: 'button' }, '+ ' + t('add_section'));
+      addSec.addEventListener('click', () => { errors = {}; model.sections.push(ccSection()); render(); });
+      compose.appendChild(addSec);
+    }
+
+    const saveBtn = h('button', { class: 'btn btn--primary btn--block', type: 'button' }, t('save_closet'));
+    saveBtn.addEventListener('click', () => save(saveBtn));
+    compose.appendChild(h('div', { class: 'form__actions' },
+      h('a', { class: 'btn btn--ghost', href: backHash }, t('cancel')), saveBtn));
+    host.appendChild(compose);
+
+    // Surface the first field error.
+    const firstErr = compose.querySelector('.field--invalid .input');
+    if (firstErr) focusFieldError(firstErr);
+  }
+
+  function sectionCard(sec, i) {
+    const card = h('div', { class: 'closet-sec' });
+    const del = h('button', { class: 'closet-sec__del', type: 'button' }, t('remove_section'));
+    del.disabled = model.sections.length <= 1;
+    del.addEventListener('click', () => { errors = {}; model.sections.splice(i, 1); render(); });
+    card.appendChild(h('div', { class: 'closet-sec__head' },
+      h('span', { class: 'closet-sec__title' }, t('section_n', { n: i + 1 })), del));
+
+    const wInput = h('input', {
+      class: 'input input--num', type: 'number', min: '10', max: '300',
+      inputmode: 'numeric', value: sec.width_cm === '' ? '' : String(sec.width_cm),
+    });
+    wInput.addEventListener('input', () => {
+      clearFieldError(wInput);
+      sec.width_cm = wInput.value === '' ? '' : Number(wInput.value);
+      redrawPreview();
+    });
+    const wField = h('label', { class: 'field field--num' },
+      h('span', { class: 'field__label' }, t('width_label')), wInput);
+    if (errors['w' + i]) setFieldError(wInput, errors['w' + i]);
+
+    const cornerBox = h('input', { type: 'checkbox' });
+    cornerBox.checked = !!sec.corner;
+    cornerBox.addEventListener('change', () => { sec.corner = cornerBox.checked; redrawPreview(); });
+    card.appendChild(h('div', { class: 'closet-sec__row' }, wField,
+      h('label', { class: 'field--corner' }, cornerBox, t('corner_section'))));
+
+    const zonesWrap = h('div', { class: 'closet-zones' });
+    sec.zones.forEach((z, j) => zonesWrap.appendChild(zoneRow(sec, i, z, j)));
+    card.appendChild(zonesWrap);
+
+    if (sec.zones.length < 20) {
+      const addZone = h('button', { class: 'btn btn--ghost btn--sm', type: 'button' }, '+ ' + t('add_zone'));
+      addZone.addEventListener('click', () => { errors = {}; sec.zones.push(ccZone('shelf')); render(); });
+      card.appendChild(addZone);
+    }
+    return card;
+  }
+
+  function zoneRow(sec, i, z, j) {
+    const kindSel = h('select', { class: 'input', 'aria-label': t('add_zone') });
+    CLOSET_KINDS.forEach(k => {
+      const opt = h('option', { value: k }, t('kind_' + k));
+      if (k === z.kind) opt.selected = true;
+      kindSel.appendChild(opt);
+    });
+
+    const hInput = h('input', {
+      class: 'input input--num', type: 'number', min: '1', max: '400', inputmode: 'numeric',
+      placeholder: t('height_rest'), 'aria-label': t('height_label'),
+      value: z.height_cm != null ? String(z.height_cm) : '',
+    });
+    hInput.addEventListener('input', () => {
+      clearFieldError(hInput);
+      z.height_cm = hInput.value === '' ? null : Number(hInput.value);
+      redrawPreview();
+    });
+    const hField = h('label', { class: 'field field--num closet-zone__h' }, hInput);
+    if (errors['z' + i + '_' + j]) setFieldError(hInput, errors['z' + i + '_' + j]);
+
+    const labelInput = h('input', {
+      class: 'input', type: 'text', dir: 'auto', value: z['label_' + getLang()] || '',
+      'aria-label': t('cell_label'), placeholder: t('kind_' + z.kind),
+    });
+    labelInput.addEventListener('input', () => { z['label_' + getLang()] = labelInput.value; redrawPreview(); });
+    kindSel.addEventListener('change', () => {
+      z.kind = kindSel.value;
+      labelInput.setAttribute('placeholder', t('kind_' + z.kind));
+      redrawPreview();
+    });
+
+    const del = h('button', { class: 'closet-zone__del', type: 'button', 'aria-label': t('remove_section') }, '×');
+    del.disabled = sec.zones.length <= 1;
+    del.addEventListener('click', () => { errors = {}; sec.zones.splice(j, 1); render(); });
+
+    return h('div', { class: 'closet-zone' },
+      h('div', { class: 'field closet-zone__kind' }, kindSel),
+      hField,
+      h('div', { class: 'field closet-zone__label' }, labelInput),
+      del);
+  }
+
+  // ----- validation + save -------------------------------------------------
+  function validate() {
+    errors = {};
+    const hv = Number(model.height_cm);
+    if (model.height_cm === '' || !Number.isFinite(hv) || hv < 50 || hv > 400) errors.height = t('err_height_range');
+    if (!model.sections.length) errors.sections = t('err_sections_min');
+    model.sections.forEach((sec, i) => {
+      const wv = Number(sec.width_cm);
+      if (sec.width_cm === '' || !Number.isFinite(wv) || wv < 10 || wv > 300) errors['w' + i] = t('err_width_range');
+      sec.zones.forEach((z, j) => {
+        if (z.height_cm != null) {
+          const zv = Number(z.height_cm);
+          if (!Number.isFinite(zv) || zv < 1 || zv > 400) errors['z' + i + '_' + j] = t('err_zone_height');
+        }
+      });
+    });
+    return Object.keys(errors).length === 0;
+  }
+
+  // Items/NFC that dropped or turned-open zones would lose — mirrors the
+  // server's degrade rules so the confirm matches what actually happens.
+  function affectedCells() {
+    const cells = state.cells.filter(c => c.unit_id === unitId);
+    const out = [];
+    cells.forEach(c => {
+      const items = itemsInCell(unitId, c.id).length;
+      const tags = state.nfc_tags.filter(tg => tg.target_kind === 'cell' && tg.target_id === c.id).length;
+      if (!items && !tags) return;
+      let survives = false;
+      if (curLayout === 'closet') {
+        const sec = model.sections[c.col];
+        const z = sec && sec.zones[c.row];
+        survives = !!z && z.kind !== 'open';   // dropped OR turned-open => lost
+      }
+      if (!survives) out.push({ cell: c, items, tags });
+    });
+    return out;
+  }
+
+  async function save(saveBtn) {
+    if (!validate()) { render(); return; }
+
+    const affected = affectedCells();
+    if (affected.length) {
+      const msg = h('div', null, h('p', null, t('closet_loss_pre')));
+      const ul = h('ul', { class: 'loss-list' });
+      affected.forEach(a => {
+        const bits = [];
+        if (a.items) bits.push(tCount('items', a.items));
+        if (a.tags) bits.push(tCount('nfc_tags', a.tags));
+        const li = h('li', null);
+        li.appendChild(h('bdi', null, cellLabel(a.cell) || t('cell')));
+        li.appendChild(document.createTextNode(' — ' + bits.join(getLang() === 'fa' ? '، ' : ', ')));
+        ul.appendChild(li);
+      });
+      msg.appendChild(ul);
+      msg.appendChild(h('p', null, t('closet_loss_post')));
+      if (!(await confirmDialog(msg, { confirmLabel: t('save_closet'), danger: true }))) return;
+    }
+
+    saveBtn.disabled = true; saveBtn.textContent = t('saving');
+    const payload = {
+      height_cm: Number(model.height_cm),
+      sections: model.sections.map(s => ({
+        width_cm: Number(s.width_cm), corner: !!s.corner,
+        zones: s.zones.map(z => ({
+          kind: z.kind, height_cm: z.height_cm == null ? null : Number(z.height_cm),
+          label_en: z.label_en || '', label_fa: z.label_fa || '', label_da: z.label_da || '',
+        })),
+      })),
+    };
+    try {
+      // One request: PUT /layout converts a 'none' OR 'grid' unit to a closet
+      // atomically server-side, so a failure can never strand the unit.
+      const res = await apiSend('PUT', 'units/' + unitId + '/layout', payload);
+      await loadBootstrap();
+      toast((res && res.warnings && res.warnings.length) ? t('closet_warn_saved') : t('toast_saved'));
+      location.hash = backHash;
+    } catch (e) {
+      saveBtn.disabled = false; saveBtn.textContent = t('save_closet');
+      toast(t('toast_error'), { kind: 'error' });
+    }
+  }
+
+  function render() { clear(host); picked ? renderEditor() : renderPicker(); }
+  render();
+  return wrap;
+}
+
+/* ============================================================ *
  *  SCREEN 6 — Borrowed view                                   *
  * ============================================================ */
 async function screenBorrowed() {
@@ -1987,7 +2850,7 @@ async function screenBorrowed() {
 
   if (!borrows.length) {
     wrap.appendChild(emptyState({
-      icon: ICONS.hand, title: t('no_borrows'), sub: t('no_borrows_sub'),
+      illo: 'hand', title: t('no_borrows'), sub: t('no_borrows_sub'),
       actionLabel: t('browse_shelves'), actionHref: '#/browse', actionIcon: ICONS.room,
     }));
     return wrap;
@@ -1999,14 +2862,18 @@ async function screenBorrowed() {
     const name = b.name_en || (item ? itemName(item) : t('untitled'));
     const dueDate = parseDate(b.due_at);
     const overdue = !!dueDate && dueDate < new Date();
+    // Calm cards by default; overdue gets the terracotta emphasis (edge rule
+    // + paper chip) so the eye lands on what actually needs chasing.
     const row = h('div', { class: 'borrow-card' + (overdue ? ' borrow-card--overdue' : '') });
     row.appendChild(h('a', { class: 'borrow-card__main', href: '#/item/' + b.item_id },
       h('span', { class: 'borrow-card__name', dir: 'auto' }, name),
+      overdue ? h('span', { class: 'chip chip--overdue' },
+        iconEl(ICONS.alert), h('span', null, t('overdue'))) : null,
       h('span', { class: 'borrow-card__who' }, t('borrowed_by') + ': ',
         h('bdi', null, b.borrowed_by || '—')),
       h('span', { class: 'borrow-card__dates' },
         t('borrowed_on') + ' ' + fmtDate(b.borrowed_at) +
-        (b.due_at ? ' · ' + (overdue ? t('overdue') : t('due') + ' ' + fmtDate(b.due_at)) : '')),
+        (b.due_at ? ' · ' + t('due') + ' ' + fmtDate(b.due_at) : '')),
     ));
     row.appendChild(h('button', {
       class: 'btn btn--primary btn--sm', type: 'button',
@@ -2116,7 +2983,7 @@ async function screenNfcManager() {
   const tags = state.nfc_tags;
   if (!tags.length) {
     wrap.appendChild(emptyState({
-      icon: ICONS.nfc, title: t('nfc_empty_title'), sub: t('nfc_empty_sub'),
+      illo: 'nfc', title: t('nfc_empty_title'), sub: t('nfc_empty_sub'),
       actionLabel: t('nfc_assign'), actionHref: '#/nfc/assign', actionIcon: ICONS.plus,
     }));
     return wrap;
@@ -2290,6 +3157,7 @@ async function screenNfcAssign(q = {}) {
   }
   function updateAssignedNote() {
     model.tagId = tagInput.value.trim();
+    if (model.tagId) clearFieldError(tagInput);
     const ex = existingFor(model.tagId);
     clear(assignedNote);
     if (ex) {
@@ -2425,6 +3293,11 @@ async function screenNfcAssign(q = {}) {
   form.appendChild(seg);
 
   // Item panel: search-as-you-type over the existing Fuse index.
+  // Inline "choose a target" error line — cleared by any target interaction.
+  const targetErr = h('p', { class: 'field__error', role: 'alert', hidden: true },
+    t('nfc_target_required'));
+  const clearTargetErr = () => { targetErr.hidden = true; };
+
   const itemPanel = h('div', { class: 'assign-panel' });
   const itemSearch = h('input', { class: 'input', type: 'search', dir: 'auto',
     placeholder: t('nfc_search_items_ph'), 'aria-label': t('search'), autocomplete: 'off' });
@@ -2433,7 +3306,7 @@ async function screenNfcAssign(q = {}) {
     const row = h('button', {
       class: 'pickrow' + (model.itemId === it.id ? ' is-selected' : ''),
       type: 'button',
-      onclick: () => { model.itemId = it.id; renderItemResults(); },
+      onclick: () => { model.itemId = it.id; clearTargetErr(); renderItemResults(); },
     });
     if (it.thumb_url) {
       row.appendChild(h('img', { class: 'pickrow__thumb', alt: '', loading: 'lazy',
@@ -2556,10 +3429,11 @@ async function screenNfcAssign(q = {}) {
     }
     renderCellPick();
   }
-  roomSel.addEventListener('change', () => { model.unitId = null; model.cellId = null; fillUnits(); });
+  roomSel.addEventListener('change', () => { model.unitId = null; model.cellId = null; clearTargetErr(); fillUnits(); });
   unitSel.addEventListener('change', () => {
     model.unitId = parseInt(unitSel.value, 10) || null;
     model.cellId = null;
+    clearTargetErr();
     renderCellPick();
   });
 
@@ -2576,11 +3450,12 @@ async function screenNfcAssign(q = {}) {
     itemPanel.hidden = m !== 'item';
     placePanel.hidden = m !== 'place';
   }
-  segItem.addEventListener('click', () => setMode('item'));
-  segPlace.addEventListener('click', () => setMode('place'));
+  segItem.addEventListener('click', () => { clearTargetErr(); setMode('item'); });
+  segPlace.addEventListener('click', () => { clearTargetErr(); setMode('place'); });
 
   form.appendChild(itemPanel);
   form.appendChild(placePanel);
+  form.appendChild(targetErr);
 
   // ---------- Step C: optional friendly name + submit ----------
   form.appendChild(h('h2', { class: 'section-title' }, t('nfc_step_name')));
@@ -2593,13 +3468,25 @@ async function screenNfcAssign(q = {}) {
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const tagId = tagInput.value.trim();
-    if (!tagId) { toast(t('nfc_tag_required'), { kind: 'error' }); tagInput.focus(); return; }
+    if (!tagId) {
+      setFieldError(tagInput, t('nfc_tag_required'));
+      toast(t('nfc_tag_required'), { kind: 'error' });
+      focusFieldError(tagInput);
+      return;
+    }
     let target_kind;
     let target_id;
     if (model.mode === 'item') { target_kind = 'item'; target_id = model.itemId; }
     else if (model.cellId != null) { target_kind = 'cell'; target_id = model.cellId; }
     else { target_kind = 'unit'; target_id = model.unitId; }
-    if (target_id == null) { toast(t('nfc_target_required'), { kind: 'error' }); return; }
+    if (target_id == null) {
+      targetErr.hidden = false;
+      toast(t('nfc_target_required'), { kind: 'error' });
+      try {
+        targetErr.scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth', block: 'center' });
+      } catch (_) {}
+      return;
+    }
 
     const name = nameInput.value.trim();
     const prevLabel = submitBtn.textContent;
@@ -2845,6 +3732,9 @@ async function route() {
       return;
     }
     return render(await screenGridEditor(parseInt(b, 10)));
+  }
+  if (a === 'unit' && b && c === 'closet') {
+    return render(await screenClosetEditor(parseInt(b, 10)));
   }
 
   if (a === 'nfc') {

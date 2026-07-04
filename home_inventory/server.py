@@ -57,7 +57,9 @@ _DEV_TRUTHY = {"1", "true", "yes", "on"}
 DEV_MODE = os.environ.get("INVENTORY_DEV", "").strip().lower() in _DEV_TRUTHY
 
 if DEV_MODE:
-    DATA_DIR = os.path.join(APP_DIR, "data")
+    # INVENTORY_DATA_DIR (DEV only) points tests at an isolated copy of the DB.
+    DATA_DIR = (os.environ.get("INVENTORY_DATA_DIR", "").strip()
+                or os.path.join(APP_DIR, "data"))
 else:
     DATA_DIR = "/data"
 
@@ -357,23 +359,13 @@ def api_bootstrap():
             ).fetchall()
         ]
         units = [
-            {
-                "id": u["id"], "room_id": u["room_id"], "name_en": u["name_en"],
-                "name_fa": u["name_fa"], "name_da": u["name_da"],
-                "grid_rows": u["grid_rows"], "grid_cols": u["grid_cols"],
-                "sort_order": u["sort_order"],
-            }
+            _serialize_unit(conn, u)
             for u in conn.execute(
                 "SELECT * FROM storage_units ORDER BY room_id, sort_order, id"
             ).fetchall()
         ]
         cells = [
-            {
-                "id": c["id"], "unit_id": c["unit_id"], "row": c["row"], "col": c["col"],
-                "row_span": c["row_span"], "col_span": c["col_span"],
-                "label_en": c["label_en"], "label_fa": c["label_fa"],
-                "label_da": c["label_da"], "kind": c["kind"],
-            }
+            _serialize_cell(c)
             for c in conn.execute(
                 "SELECT * FROM cells ORDER BY unit_id, row, col"
             ).fetchall()
@@ -449,6 +441,34 @@ def _ensure_one_primary(conn, item_id):
         conn.execute(
             "UPDATE item_locations SET is_primary=1 WHERE id=?", (lowest["id"],)
         )
+
+
+def _degrade_cell_locations(conn, unit_id, cell_id, affected_items: set) -> int:
+    """
+    Move item_locations off a cell that stops being trackable storage (zone
+    dropped or turned 'open'): degrade them to unit-level (cell_id NULL),
+    deduping against an existing unit-level row for the same item (SQLite's
+    UNIQUE treats NULLs as distinct, so the dupe must be removed by hand).
+    Returns the number of distinct items affected; adds their ids to
+    `affected_items` so the caller can re-run _ensure_one_primary. No commit.
+    """
+    rows = conn.execute(
+        "SELECT id, item_id FROM item_locations WHERE cell_id=?", (cell_id,)
+    ).fetchall()
+    if not rows:
+        return 0
+    item_ids = {r["item_id"] for r in rows}
+    affected_items |= item_ids
+    conn.execute(
+        "DELETE FROM item_locations WHERE cell_id=? AND item_id IN ("
+        "  SELECT item_id FROM item_locations "
+        "  WHERE unit_id=? AND cell_id IS NULL)",
+        (cell_id, unit_id),
+    )
+    conn.execute(
+        "UPDATE item_locations SET cell_id=NULL WHERE cell_id=?", (cell_id,)
+    )
+    return len(item_ids)
 
 
 def _insert_locations(conn, item_id, locations):
@@ -1075,11 +1095,49 @@ def api_room_delete(room_id):
 # API: storage units + cells
 # ---------------------------------------------------------------------------
 
-def _serialize_unit(u):
+# Layout modes: 'grid' (uniform rows x cols), 'closet' (sections + zones),
+# 'none' (no internal layout).
+UNIT_LAYOUTS = ("grid", "closet", "none")
+# Valid zone kinds in closet mode. 'open' = open space, display-only.
+CLOSET_ZONE_KINDS = ("drawer", "shelf", "hanging", "basket", "open")
+# Trackable (assignable / storage) zone kinds in closet mode.
+CLOSET_TRACKABLE_KINDS = ("drawer", "shelf", "hanging", "basket")
+
+
+def _cell_trackable(kind, layout):
+    """Business rule: which compartments are real (assignable) storage.
+
+    grid (and legacy/none) : only 'door' cells;
+    closet                 : drawer/shelf/hanging/basket ('open' is display-only).
+    """
+    if layout == "closet":
+        return kind in CLOSET_TRACKABLE_KINDS
+    return kind == "door"
+
+
+def _unit_sections(conn, unit_id):
+    """Closet section geometry rows for a unit (lean, bootstrap-friendly)."""
+    return [
+        {
+            "col": s["col_index"],
+            "width_cm": s["width_cm"],
+            "corner": bool(s["corner"]),
+        }
+        for s in conn.execute(
+            "SELECT * FROM unit_sections WHERE unit_id=? ORDER BY sort, col_index",
+            (unit_id,),
+        ).fetchall()
+    ]
+
+
+def _serialize_unit(conn, u):
     return {
         "id": u["id"], "room_id": u["room_id"], "name_en": u["name_en"],
         "name_fa": u["name_fa"], "name_da": u["name_da"],
         "grid_rows": u["grid_rows"], "grid_cols": u["grid_cols"],
+        "layout": u["layout"], "height_cm": u["height_cm"],
+        "sections": (_unit_sections(conn, u["id"])
+                     if u["layout"] == "closet" else []),
         "sort_order": u["sort_order"],
     }
 
@@ -1089,13 +1147,18 @@ def _serialize_cell(c):
         "id": c["id"], "unit_id": c["unit_id"], "row": c["row"], "col": c["col"],
         "row_span": c["row_span"], "col_span": c["col_span"],
         "label_en": c["label_en"], "label_fa": c["label_fa"], "label_da": c["label_da"],
-        "kind": c["kind"],
+        "kind": c["kind"], "height_cm": c["height_cm"],
     }
 
 
 def _coerce_kind(value):
-    """Cell kind is 'door' or 'open'; coerce anything not 'open' to 'door'."""
+    """Grid cell kind is 'door' or 'open'; coerce anything not 'open' to 'door'."""
     return "open" if value == "open" else "door"
+
+
+def _is_num(v):
+    """True for real JSON numbers (bool is an int subclass — exclude it)."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
 def _cell_label(row, col):
@@ -1129,7 +1192,7 @@ def api_units_list():
             rows = conn.execute(
                 "SELECT * FROM storage_units ORDER BY room_id, sort_order, id"
             ).fetchall()
-        return jsonify({"units": [_serialize_unit(u) for u in rows]})
+        return jsonify({"units": [_serialize_unit(conn, u) for u in rows]})
     finally:
         conn.close()
 
@@ -1142,27 +1205,45 @@ def api_unit_create():
     room_id = body.get("room_id")
     if room_id is None:
         return jsonify({"error": "room_id required"}), 400
+    req_layout = body.get("layout")
+    if req_layout is not None and req_layout not in UNIT_LAYOUTS:
+        return jsonify({"error": "invalid layout"}), 400
+    height_cm = body.get("height_cm")
+    if height_cm is not None and (not _is_num(height_cm)
+                                  or not 50 <= height_cm <= 400):
+        return jsonify(
+            {"error": "height_cm must be a number between 50 and 400, or null"}
+        ), 400
     # Clamp grid dimensions to [0,20] (matches the frontend grid editor cap).
     grid_rows = max(0, min(20, as_int(body.get("grid_rows", 0), 0)))
     grid_cols = max(0, min(20, as_int(body.get("grid_cols", 0), 0)))
+    # Invariant: layout=='grid' <=> rows>0 and cols>0; closet/none carry 0x0.
+    # A closet is created empty here — sections/zones arrive via PUT /layout.
+    if req_layout == "closet":
+        layout, grid_rows, grid_cols = "closet", 0, 0
+    elif req_layout == "none":
+        layout, grid_rows, grid_cols = "none", 0, 0
+    else:
+        layout = "grid" if (grid_rows > 0 and grid_cols > 0) else "none"
     conn = get_db()
     try:
         cur = conn.execute(
             "INSERT INTO storage_units "
-            "(room_id, name_en, name_fa, name_da, grid_rows, grid_cols, sort_order) "
-            "VALUES (?,?,?,?,?,?,?)",
+            "(room_id, name_en, name_fa, name_da, grid_rows, grid_cols, "
+            " layout, height_cm, sort_order) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (room_id, body.get("name_en", "") or "", body.get("name_fa", "") or "",
              body.get("name_da", "") or "", grid_rows, grid_cols,
-             as_int(body.get("sort_order", 0), 0)),
+             layout, height_cm, as_int(body.get("sort_order", 0), 0)),
         )
         unit_id = cur.lastrowid
-        if grid_rows > 0 and grid_cols > 0:
+        if layout == "grid":
             _auto_create_cells(conn, unit_id, grid_rows, grid_cols)
         conn.commit()
         u = conn.execute(
             "SELECT * FROM storage_units WHERE id=?", (unit_id,)
         ).fetchone()
-        return jsonify(_serialize_unit(u)), 201
+        return jsonify(_serialize_unit(conn, u)), 201
     finally:
         conn.close()
 
@@ -1180,6 +1261,31 @@ def api_unit_update(unit_id):
         if u is None:
             return jsonify({"error": "not found"}), 404
 
+        # ----- layout-mode validation ---------------------------------------
+        # PATCH may switch to 'grid'/'none' only; 'closet' is entered solely
+        # via PUT /api/units/<id>/layout (which needs the sections payload).
+        req_layout = None
+        if "layout" in body:
+            req_layout = body["layout"]
+            if req_layout == "closet":
+                return jsonify({
+                    "error": "closet layout is set via PUT /api/units/<id>/layout"
+                }), 400
+            if req_layout not in ("grid", "none"):
+                return jsonify({"error": "invalid layout"}), 400
+        if (u["layout"] == "closet" and req_layout is None
+                and ("grid_rows" in body or "grid_cols" in body)):
+            return jsonify({
+                "error": "unit uses closet layout; "
+                         "use /api/units/<id>/layout (or switch layout first)"
+            }), 400
+        if "height_cm" in body:
+            h = body["height_cm"]
+            if h is not None and (not _is_num(h) or not 50 <= h <= 400):
+                return jsonify({
+                    "error": "height_cm must be a number between 50 and 400, or null"
+                }), 400
+
         sets, params = [], []
         for key in ("name_en", "name_fa", "name_da", "room_id"):
             if key in body:
@@ -1188,23 +1294,61 @@ def api_unit_update(unit_id):
         if "sort_order" in body:
             sets.append("sort_order = ?")
             params.append(as_int(body["sort_order"], 0))
+        if "height_cm" in body:
+            sets.append("height_cm = ?")
+            params.append(body["height_cm"])
 
-        # Grid resize: re-sync cells. New cells added; cells outside the new
-        # bounds removed; existing in-bounds cells (and their labels) kept.
-        # Clamp to [0,20] (matches the frontend grid editor cap).
-        new_rows = (max(0, min(20, as_int(body["grid_rows"], u["grid_rows"])))
-                    if "grid_rows" in body else u["grid_rows"])
-        new_cols = (max(0, min(20, as_int(body["grid_cols"], u["grid_cols"])))
-                    if "grid_cols" in body else u["grid_cols"])
-        grid_changed = ("grid_rows" in body or "grid_cols" in body) and (
-            new_rows != u["grid_rows"] or new_cols != u["grid_cols"]
-        )
-        if "grid_rows" in body:
+        # ----- leaving closet mode: tear the sections/zones down -------------
+        # Zones are deleted (item locations degrade to unit-level, NFC cell
+        # tags removed) and the section geometry dropped; then the normal grid
+        # logic below may build a fresh grid from the requested dims.
+        leaving_closet = (u["layout"] == "closet" and req_layout is not None)
+        if leaving_closet:
+            affected = set()
+            old_cells = conn.execute(
+                "SELECT id FROM cells WHERE unit_id=?", (unit_id,)
+            ).fetchall()
+            for c in old_cells:
+                _degrade_cell_locations(conn, unit_id, c["id"], affected)
+            db.nfc_delete_for_targets(conn, "cell", [c["id"] for c in old_cells])
+            conn.execute("DELETE FROM cells WHERE unit_id=?", (unit_id,))
+            conn.execute("DELETE FROM unit_sections WHERE unit_id=?", (unit_id,))
+            for iid in affected:
+                _ensure_one_primary(conn, iid)
+
+        # ----- grid dims + derived layout ------------------------------------
+        if u["layout"] == "closet" and not leaving_closet:
+            # Names/sort/height-only PATCH on a closet: leave layout untouched.
+            final_rows, final_cols, final_layout = 0, 0, "closet"
+            grid_changed = False
+        else:
+            base_rows = 0 if leaving_closet else u["grid_rows"]
+            base_cols = 0 if leaving_closet else u["grid_cols"]
+            # Grid resize: re-sync cells. New cells added; cells outside the
+            # new bounds removed; existing in-bounds cells (labels too) kept.
+            # Clamp to [0,20] (matches the frontend grid editor cap).
+            final_rows = (max(0, min(20, as_int(body["grid_rows"], base_rows)))
+                          if "grid_rows" in body else base_rows)
+            final_cols = (max(0, min(20, as_int(body["grid_cols"], base_cols)))
+                          if "grid_cols" in body else base_cols)
+            if req_layout == "none":
+                # Explicit 'none' = clear any grid.
+                final_rows = final_cols = 0
+            # Invariant: layout=='grid' <=> rows>0 and cols>0.
+            final_layout = ("grid" if (final_rows > 0 and final_cols > 0)
+                            else "none")
+            grid_changed = (final_rows != u["grid_rows"]
+                            or final_cols != u["grid_cols"])
+
+        if final_rows != u["grid_rows"]:
             sets.append("grid_rows = ?")
-            params.append(new_rows)
-        if "grid_cols" in body:
+            params.append(final_rows)
+        if final_cols != u["grid_cols"]:
             sets.append("grid_cols = ?")
-            params.append(new_cols)
+            params.append(final_cols)
+        if final_layout != u["layout"]:
+            sets.append("layout = ?")
+            params.append(final_layout)
 
         if sets:
             params.append(unit_id)
@@ -1217,22 +1361,22 @@ def api_unit_update(unit_id):
             # assignments must be cleaned up — nfc_tags has no FK).
             dropped = [c["id"] for c in conn.execute(
                 "SELECT id FROM cells WHERE unit_id=? AND (row >= ? OR col >= ?)",
-                (unit_id, new_rows, new_cols),
+                (unit_id, final_rows, final_cols),
             ).fetchall()]
             conn.execute(
                 "DELETE FROM cells WHERE unit_id=? AND (row >= ? OR col >= ?)",
-                (unit_id, new_rows, new_cols),
+                (unit_id, final_rows, final_cols),
             )
             db.nfc_delete_for_targets(conn, "cell", dropped)
             # Add any missing in-bounds cells.
-            if new_rows > 0 and new_cols > 0:
-                _auto_create_cells(conn, unit_id, new_rows, new_cols)
+            if final_rows > 0 and final_cols > 0:
+                _auto_create_cells(conn, unit_id, final_rows, final_cols)
 
         conn.commit()
         u2 = conn.execute(
             "SELECT * FROM storage_units WHERE id=?", (unit_id,)
         ).fetchone()
-        return jsonify(_serialize_unit(u2))
+        return jsonify(_serialize_unit(conn, u2))
     finally:
         conn.close()
 
@@ -1261,6 +1405,15 @@ def api_unit_delete(unit_id):
 def api_unit_cells_get(unit_id):
     conn = get_db()
     try:
+        u = conn.execute(
+            "SELECT layout FROM storage_units WHERE id=?", (unit_id,)
+        ).fetchone()
+        if u is None:
+            return jsonify({"error": "not found"}), 404
+        if u["layout"] == "closet":
+            return jsonify({
+                "error": "unit uses closet layout; use /api/units/<id>/layout"
+            }), 400
         rows = conn.execute(
             "SELECT * FROM cells WHERE unit_id=? ORDER BY row, col", (unit_id,)
         ).fetchall()
@@ -1280,10 +1433,15 @@ def api_unit_cells_put(unit_id):
         return jsonify({"error": "cells array required"}), 400
     conn = get_db()
     try:
-        if conn.execute(
-            "SELECT 1 FROM storage_units WHERE id=?", (unit_id,)
-        ).fetchone() is None:
+        u = conn.execute(
+            "SELECT layout FROM storage_units WHERE id=?", (unit_id,)
+        ).fetchone()
+        if u is None:
             return jsonify({"error": "not found"}), 404
+        if u["layout"] == "closet":
+            return jsonify({
+                "error": "unit uses closet layout; use /api/units/<id>/layout"
+            }), 400
         # The replace assigns fresh cell ids, so remember which (row,col)
         # positions carry an NFC tag; the tags get retargeted (or dropped)
         # after the re-insert below.
@@ -1332,6 +1490,418 @@ def api_unit_cells_put(unit_id):
         return jsonify({"cells": [_serialize_cell(c) for c in rows]})
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# API: closet layouts (sections + zones) — layout='closet' units
+# ---------------------------------------------------------------------------
+#
+# Model recap: a closet is vertical SECTIONS (left->right, unit_sections rows,
+# col_index 0-based) each stacked with ZONES top->bottom. Zones live in the
+# ordinary `cells` table (col = section index, row = zone index) so that
+# item_locations.cell_id, NFC cell targets, contents sheets and count badges
+# keep working unchanged.
+
+def _layout_err(message, section=None, zone=None):
+    """400 payload for layout validation; carries indices when relevant."""
+    out = {"error": message}
+    if section is not None:
+        out["section"] = section
+    if zone is not None:
+        out["zone"] = zone
+    return jsonify(out), 400
+
+
+def _validate_layout_body(body):
+    """
+    Validate + parse a PUT /layout body. Returns (error_response, parsed):
+    exactly one is None. Parsed shape:
+      {"height_cm": float, "sections": [
+          {"width_cm": float, "corner": bool, "zones": [
+              {"kind": str, "height_cm": float|None,
+               "label_en": str, "label_fa": str, "label_da": str}]}]}
+    """
+    h = body.get("height_cm")
+    if not _is_num(h) or not 50 <= h <= 400:
+        return _layout_err("height_cm must be a number between 50 and 400"), None
+    sections = body.get("sections")
+    if not isinstance(sections, list) or len(sections) < 1:
+        return _layout_err("at least one section is required"), None
+    if len(sections) > 8:
+        return _layout_err("at most 8 sections are allowed"), None
+    parsed_sections = []
+    for i, s in enumerate(sections):
+        if not isinstance(s, dict):
+            return _layout_err("section must be an object", section=i), None
+        w = s.get("width_cm")
+        if not _is_num(w) or not 10 <= w <= 300:
+            return _layout_err(
+                "width_cm must be a number between 10 and 300", section=i
+            ), None
+        zones = s.get("zones", [])
+        if not isinstance(zones, list):
+            return _layout_err("zones must be an array", section=i), None
+        if len(zones) > 20:
+            return _layout_err(
+                "at most 20 zones per section are allowed", section=i
+            ), None
+        parsed_zones = []
+        for j, z in enumerate(zones):
+            if not isinstance(z, dict):
+                return _layout_err("zone must be an object",
+                                   section=i, zone=j), None
+            kind = z.get("kind")
+            if kind not in CLOSET_ZONE_KINDS:
+                return _layout_err(
+                    "invalid zone kind (drawer|shelf|hanging|basket|open)",
+                    section=i, zone=j,
+                ), None
+            zh = z.get("height_cm")
+            if zh is not None and (not _is_num(zh) or not 1 <= zh <= 400):
+                return _layout_err(
+                    "zone height_cm must be a number between 1 and 400, "
+                    "or null (flex)", section=i, zone=j,
+                ), None
+            parsed_zones.append({
+                "kind": kind,
+                "height_cm": float(zh) if zh is not None else None,
+                "label_en": str(z.get("label_en", "") or ""),
+                "label_fa": str(z.get("label_fa", "") or ""),
+                "label_da": str(z.get("label_da", "") or ""),
+            })
+        parsed_sections.append({
+            "width_cm": float(w),
+            "corner": bool(s.get("corner", False)),
+            "zones": parsed_zones,
+        })
+    return None, {"height_cm": float(h), "sections": parsed_sections}
+
+
+def _layout_payload(conn, u):
+    """Canonical GET/PUT /layout response body for a unit row."""
+    zones_by_col = {}
+    for c in conn.execute(
+        "SELECT * FROM cells WHERE unit_id=? ORDER BY col, row", (u["id"],)
+    ).fetchall():
+        zones_by_col.setdefault(c["col"], []).append(_serialize_cell(c))
+    return {
+        "unit_id": u["id"],
+        "layout": u["layout"],
+        "height_cm": u["height_cm"],
+        "sections": [
+            {
+                "col": s["col_index"],
+                "width_cm": s["width_cm"],
+                "corner": bool(s["corner"]),
+                "zones": zones_by_col.get(s["col_index"], []),
+            }
+            for s in conn.execute(
+                "SELECT * FROM unit_sections WHERE unit_id=? "
+                "ORDER BY sort, col_index", (u["id"],)
+            ).fetchall()
+        ],
+    }
+
+
+@app.route("/api/units/<int:unit_id>/layout", methods=["GET"])
+def api_unit_layout_get(unit_id):
+    """Closet layout of a unit. 400 for grid units (those use /cells)."""
+    conn = get_db()
+    try:
+        u = conn.execute(
+            "SELECT * FROM storage_units WHERE id=?", (unit_id,)
+        ).fetchone()
+        if u is None:
+            return jsonify({"error": "not found"}), 404
+        if u["layout"] == "grid":
+            return jsonify({
+                "error": "unit uses grid layout; use /api/units/<id>/cells"
+            }), 400
+        # layout 'none' answers {"layout":"none", "sections":[]} so the
+        # frontend can probe uniformly before offering a closet editor.
+        return jsonify(_layout_payload(conn, u))
+    finally:
+        conn.close()
+
+
+@app.route("/api/units/<int:unit_id>/layout", methods=["PUT"])
+def api_unit_layout_put(unit_id):
+    """
+    Bulk-replace a unit's closet layout (sections + zones); switches a
+    layout='none' OR layout='grid' unit to 'closet' in a single transaction
+    (a grid is torn down here first — see below — so the client never has to
+    do a separate destructive PATCH that could leave the unit stranded).
+
+    Zones are matched by (col=section index, row=zone index): surviving
+    positions KEEP their cell id, so item_locations and NFC tags on them
+    survive untouched. Dropped zones degrade their item locations to
+    unit-level and lose their NFC tags; zones that turn 'open' (display-only)
+    do the same. A grid unit's cells are all torn down (grid coordinates
+    don't map to closet zones). All of these are reported in `warnings`.
+    """
+    body = json_body()
+    if body is None:
+        return jsonify({"error": "invalid json body"}), 400
+    conn = get_db()
+    try:
+        u = conn.execute(
+            "SELECT * FROM storage_units WHERE id=?", (unit_id,)
+        ).fetchone()
+        if u is None:
+            return jsonify({"error": "not found"}), 404
+        # Validate the whole payload BEFORE touching anything, so an invalid
+        # closet body can never tear a grid down.
+        err, parsed = _validate_layout_body(body)
+        if err is not None:
+            return err
+
+        # New zone map: (row, col) -> zone spec.
+        new_pos = {}
+        for i, s in enumerate(parsed["sections"]):
+            for j, z in enumerate(s["zones"]):
+                new_pos[(j, i)] = z
+
+        warnings = []
+        affected_items = set()
+
+        def _nfc_count_and_drop(cell_id):
+            n = conn.execute(
+                "SELECT COUNT(*) AS n FROM nfc_tags "
+                "WHERE target_kind='cell' AND target_id=?", (cell_id,)
+            ).fetchone()["n"]
+            if n:
+                db.nfc_delete_for_targets(conn, "cell", [cell_id])
+            return n
+
+        # Grid -> closet, atomically: grid coordinates don't map onto closet
+        # zones, so every grid cell is torn down (items degrade to unit-level,
+        # cell NFC tags drop) and the closet is built from a clean slate below.
+        # Done in THIS transaction so a failure can't strand the unit between
+        # a destroyed grid and an unsaved closet.
+        if u["layout"] == "grid":
+            for c in conn.execute(
+                "SELECT * FROM cells WHERE unit_id=?", (unit_id,)
+            ).fetchall():
+                items_n = _degrade_cell_locations(conn, unit_id, c["id"],
+                                                  affected_items)
+                nfc_n = _nfc_count_and_drop(c["id"])
+                if items_n or nfc_n:
+                    warnings.append({
+                        "type": "grid_replaced",
+                        "row": c["row"], "col": c["col"],
+                        "label_en": c["label_en"], "label_fa": c["label_fa"],
+                        "label_da": c["label_da"], "kind": c["kind"],
+                        "items_moved_to_unit": items_n,
+                        "nfc_tags_removed": nfc_n,
+                    })
+            conn.execute("DELETE FROM cells WHERE unit_id=?", (unit_id,))
+
+        # Existing zones (empty for a just-torn-down grid or a 'none' unit).
+        existing = {
+            (c["row"], c["col"]): c
+            for c in conn.execute(
+                "SELECT * FROM cells WHERE unit_id=?", (unit_id,)
+            ).fetchall()
+        }
+
+        # 1) Dropped zones: position gone from the new layout.
+        for pos, c in existing.items():
+            if pos in new_pos:
+                continue
+            items_n = _degrade_cell_locations(conn, unit_id, c["id"],
+                                              affected_items)
+            nfc_n = _nfc_count_and_drop(c["id"])
+            conn.execute("DELETE FROM cells WHERE id=?", (c["id"],))
+            if items_n or nfc_n:
+                warnings.append({
+                    "type": "zone_dropped",
+                    "row": pos[0], "col": pos[1],
+                    "label_en": c["label_en"], "label_fa": c["label_fa"],
+                    "label_da": c["label_da"], "kind": c["kind"],
+                    "items_moved_to_unit": items_n,
+                    "nfc_tags_removed": nfc_n,
+                })
+
+        # 2) Surviving + new zones.
+        for (row, col), z in new_pos.items():
+            c = existing.get((row, col))
+            if c is None:
+                conn.execute(
+                    "INSERT INTO cells "
+                    "(unit_id, row, col, row_span, col_span, "
+                    " label_en, label_fa, label_da, kind, height_cm) "
+                    "VALUES (?,?,?,1,1,?,?,?,?,?)",
+                    (unit_id, row, col, z["label_en"], z["label_fa"],
+                     z["label_da"], z["kind"], z["height_cm"]),
+                )
+                continue
+            # Survivor: keep the cell id (locations/tags stay valid). When it
+            # turns 'open' it stops being storage -> degrade + drop tags.
+            if (z["kind"] == "open"
+                    and _cell_trackable(c["kind"], u["layout"])):
+                items_n = _degrade_cell_locations(conn, unit_id, c["id"],
+                                                  affected_items)
+                nfc_n = _nfc_count_and_drop(c["id"])
+                if items_n or nfc_n:
+                    warnings.append({
+                        "type": "zone_untracked",
+                        "row": row, "col": col,
+                        "label_en": z["label_en"], "label_fa": z["label_fa"],
+                        "label_da": z["label_da"], "kind": z["kind"],
+                        "items_moved_to_unit": items_n,
+                        "nfc_tags_removed": nfc_n,
+                    })
+            conn.execute(
+                "UPDATE cells SET kind=?, height_cm=?, "
+                "label_en=?, label_fa=?, label_da=? WHERE id=?",
+                (z["kind"], z["height_cm"], z["label_en"], z["label_fa"],
+                 z["label_da"], c["id"]),
+            )
+
+        # 3) Section geometry: full replace (order in the array = col order).
+        conn.execute("DELETE FROM unit_sections WHERE unit_id=?", (unit_id,))
+        for i, s in enumerate(parsed["sections"]):
+            conn.execute(
+                "INSERT INTO unit_sections "
+                "(unit_id, col_index, width_cm, corner, sort) "
+                "VALUES (?,?,?,?,?)",
+                (unit_id, i, s["width_cm"], int(s["corner"]), i),
+            )
+
+        # 4) The unit itself: closet mode, no grid dims.
+        conn.execute(
+            "UPDATE storage_units SET layout='closet', height_cm=?, "
+            "grid_rows=0, grid_cols=0 WHERE id=?",
+            (parsed["height_cm"], unit_id),
+        )
+        for iid in affected_items:
+            _ensure_one_primary(conn, iid)
+        conn.commit()
+
+        u2 = conn.execute(
+            "SELECT * FROM storage_units WHERE id=?", (unit_id,)
+        ).fetchone()
+        out = _layout_payload(conn, u2)
+        out["warnings"] = warnings
+        return jsonify(out)
+    finally:
+        conn.close()
+
+
+# Server-side closet starting points (frontend offers them; all editable).
+# Shapes match the PUT /layout body so a template can be applied verbatim.
+LAYOUT_TEMPLATES = [
+    {
+        "id": "pax_100_wardrobe",
+        "name_en": "PAX 100 wardrobe",
+        "name_fa": "کمد پاکس ۱۰۰",
+        "name_da": "PAX 100 garderobeskab",
+        "desc_en": "Editable starting point — adjust sizes and zones after applying.",
+        "desc_fa": "نقطهٔ شروع قابل ویرایش — اندازه‌ها و بخش‌ها را پس از اعمال تنظیم کنید.",
+        "desc_da": "Redigerbart udgangspunkt — justér mål og zoner bagefter.",
+        "height_cm": 236,
+        "sections": [
+            {"width_cm": 100, "corner": False, "zones": [
+                {"kind": "shelf", "height_cm": 38,
+                 "label_en": "Top shelf", "label_fa": "قفسهٔ بالا",
+                 "label_da": "Øverste hylde"},
+                {"kind": "hanging", "height_cm": 150,
+                 "label_en": "Hanging rail", "label_fa": "میلهٔ آویز",
+                 "label_da": "Bøjlestang"},
+                {"kind": "drawer", "height_cm": 24,
+                 "label_en": "Drawer 1", "label_fa": "کشوی ۱",
+                 "label_da": "Skuffe 1"},
+                {"kind": "drawer", "height_cm": 24,
+                 "label_en": "Drawer 2", "label_fa": "کشوی ۲",
+                 "label_da": "Skuffe 2"},
+            ]},
+        ],
+    },
+    {
+        "id": "pax_50_drawers",
+        "name_en": "PAX 50 drawers",
+        "name_fa": "پاکس ۵۰ کشودار",
+        "name_da": "PAX 50 med skuffer",
+        "desc_en": "Editable starting point — adjust sizes and zones after applying.",
+        "desc_fa": "نقطهٔ شروع قابل ویرایش — اندازه‌ها و بخش‌ها را پس از اعمال تنظیم کنید.",
+        "desc_da": "Redigerbart udgangspunkt — justér mål og zoner bagefter.",
+        "height_cm": 236,
+        "sections": [
+            {"width_cm": 50, "corner": False, "zones": [
+                {"kind": "drawer", "height_cm": None,
+                 "label_en": f"Drawer {n}", "label_fa": f"کشوی {fa}",
+                 "label_da": f"Skuffe {n}"}
+                for n, fa in ((1, "۱"), (2, "۲"), (3, "۳"),
+                              (4, "۴"), (5, "۵"), (6, "۶"))
+            ]},
+        ],
+    },
+    {
+        "id": "pax_50_shelves",
+        "name_en": "PAX 50 shelves",
+        "name_fa": "پاکس ۵۰ قفسه‌دار",
+        "name_da": "PAX 50 med hylder",
+        "desc_en": "Editable starting point — adjust sizes and zones after applying.",
+        "desc_fa": "نقطهٔ شروع قابل ویرایش — اندازه‌ها و بخش‌ها را پس از اعمال تنظیم کنید.",
+        "desc_da": "Redigerbart udgangspunkt — justér mål og zoner bagefter.",
+        "height_cm": 236,
+        "sections": [
+            {"width_cm": 50, "corner": False, "zones": [
+                {"kind": "shelf", "height_cm": None,
+                 "label_en": f"Shelf {n}", "label_fa": f"قفسهٔ {fa}",
+                 "label_da": f"Hylde {n}"}
+                for n, fa in ((1, "۱"), (2, "۲"), (3, "۳"),
+                              (4, "۴"), (5, "۵"), (6, "۶"))
+            ]},
+        ],
+    },
+    {
+        "id": "pax_l_100_50",
+        "name_en": "L-shape PAX 100+50",
+        "name_fa": "پاکس ال‌شکل ۱۰۰+۵۰",
+        "name_da": "PAX 100+50 i L-form",
+        "desc_en": "Editable starting point — adjust sizes and zones after applying.",
+        "desc_fa": "نقطهٔ شروع قابل ویرایش — اندازه‌ها و بخش‌ها را پس از اعمال تنظیم کنید.",
+        "desc_da": "Redigerbart udgangspunkt — justér mål og zoner bagefter.",
+        "height_cm": 236,
+        "sections": [
+            {"width_cm": 100, "corner": True, "zones": [
+                {"kind": "shelf", "height_cm": 38,
+                 "label_en": "Top shelf", "label_fa": "قفسهٔ بالا",
+                 "label_da": "Øverste hylde"},
+                {"kind": "hanging", "height_cm": 198,
+                 "label_en": "Hanging rail", "label_fa": "میلهٔ آویز",
+                 "label_da": "Bøjlestang"},
+            ]},
+            {"width_cm": 50, "corner": False, "zones": [
+                {"kind": "shelf", "height_cm": None,
+                 "label_en": "Shelf 1", "label_fa": "قفسهٔ ۱",
+                 "label_da": "Hylde 1"},
+                {"kind": "shelf", "height_cm": None,
+                 "label_en": "Shelf 2", "label_fa": "قفسهٔ ۲",
+                 "label_da": "Hylde 2"},
+                {"kind": "shelf", "height_cm": None,
+                 "label_en": "Shelf 3", "label_fa": "قفسهٔ ۳",
+                 "label_da": "Hylde 3"},
+                {"kind": "drawer", "height_cm": 30,
+                 "label_en": "Drawer 1", "label_fa": "کشوی ۱",
+                 "label_da": "Skuffe 1"},
+                {"kind": "drawer", "height_cm": 30,
+                 "label_en": "Drawer 2", "label_fa": "کشوی ۲",
+                 "label_da": "Skuffe 2"},
+                {"kind": "drawer", "height_cm": 30,
+                 "label_en": "Drawer 3", "label_fa": "کشوی ۳",
+                 "label_da": "Skuffe 3"},
+            ]},
+        ],
+    },
+]
+
+
+@app.route("/api/units/layout_templates", methods=["GET"])
+def api_layout_templates():
+    """Named closet starting points (plain data; apply via PUT /layout)."""
+    return jsonify({"templates": LAYOUT_TEMPLATES})
 
 
 # ---------------------------------------------------------------------------
@@ -1455,7 +2025,7 @@ def serialize_nfc_tag(conn: sqlite3.Connection, t: sqlite3.Row) -> dict:
                 "SELECT * FROM storage_units WHERE id=?", (c["unit_id"],)
             ).fetchone()
     if unit_row is not None:
-        out["unit"] = _serialize_unit(unit_row)
+        out["unit"] = _serialize_unit(conn, unit_row)
         r = conn.execute(
             "SELECT * FROM rooms WHERE id=?", (unit_row["room_id"],)
         ).fetchone()
@@ -1467,8 +2037,10 @@ def serialize_nfc_tag(conn: sqlite3.Connection, t: sqlite3.Row) -> dict:
 def _validate_nfc_target(conn, target_kind, target_id):
     """
     Validate an assignment target. Returns None when OK, else a (response,
-    status) tuple. Business rule (Mohsen): only 'door' cells are assignable —
-    'open' display cubbies are not trackable storage.
+    status) tuple. Business rule (Mohsen): only trackable compartments are
+    assignable — in grid mode that is 'door' cells; in closet mode it is
+    drawer/shelf/hanging/basket zones. 'open' (display cubby / open space)
+    is never trackable storage.
     """
     if target_kind not in ("item", "unit", "cell"):
         return jsonify({"error": "invalid target_kind"}), 400
@@ -1484,11 +2056,17 @@ def _validate_nfc_target(conn, target_kind, target_id):
             return jsonify({"error": "target not found"}), 404
     else:  # cell
         c = conn.execute(
-            "SELECT kind FROM cells WHERE id=?", (target_id,)
+            "SELECT c.kind AS kind, u.layout AS layout FROM cells c "
+            "JOIN storage_units u ON u.id = c.unit_id WHERE c.id=?",
+            (target_id,),
         ).fetchone()
         if c is None:
             return jsonify({"error": "target not found"}), 404
-        if c["kind"] != "door":
+        if not _cell_trackable(c["kind"], c["layout"]):
+            if c["layout"] == "closet":
+                return jsonify(
+                    {"error": "open zones cannot be assigned"}
+                ), 400
             return jsonify(
                 {"error": "only door cells can be assigned"}
             ), 400
