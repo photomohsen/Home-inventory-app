@@ -527,6 +527,7 @@ const ICONS = {
   plus: 'M11 5v6H5v2h6v6h2v-6h6v-2h-6V5z',
   nfc: 'M20 2H4a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2Zm0 18H4V4h16v16ZM18 6h-5a2 2 0 0 0-2 2v2.28c-.6.35-1 .98-1 1.72a2 2 0 1 0 4 0c0-.74-.4-1.37-1-1.72V8h3v8H8V8h2V6H6v12h12V6Z',
   grid: 'M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z',
+  home: 'M12 3 2 12h3v8h6v-6h2v6h6v-8h3z',
 };
 // All ICONS above are filled-shape paths (fill:currentColor via .icon).
 function iconEl(path, cls) {
@@ -738,9 +739,11 @@ function renderShell() {
   viewRoot = h('main', { id: 'view', class: 'view', tabindex: '-1' });
 
   const nav = h('nav', { class: 'tabbar', 'aria-label': t('menu') },
-    tabLink('#/', ICONS.search, 'nav_home'),
-    tabLink('#/browse', ICONS.room, 'nav_browse'),
+    tabLink('#/', ICONS.home, 'nav_start'),
+    tabLink('#/search', ICONS.search, 'nav_home'),
+    tabLink('#/browse', ICONS.grid, 'nav_browse'),
     tabLink('#/borrowed', ICONS.hand, 'nav_borrowed'),
+    tabLink('#/objects', ICONS.box, 'nav_objects'),
   );
 
   // Persistent camera FAB (quick add).
@@ -953,13 +956,18 @@ let lastQuery = '';
 // still holds that code, the results area offers "add new item with this barcode".
 let scanOffer = null;
 
-function screenHome() {
-  const wrap = h('div', { class: 'screen screen--home' });
+function screenHome(mode) {
+  const isSearch = mode === 'search';
+  const wrap = h('div', { class: 'screen screen--home' + (isSearch ? ' screen--search' : '') });
+
+  // The dedicated Search tab gets a page title; the Home landing keeps the masthead.
+  if (isSearch) wrap.appendChild(pageHead(t('search')));
 
   const hero = h('section', { class: 'hero' });
   // Serif hero line — the magazine masthead. (With 0 items the first-run
-  // hero below carries the tagline instead, so skip it here.)
-  if (state.items.length) {
+  // hero below carries the tagline instead, so skip it here. The Search
+  // screen has its own page title, so no masthead there either.)
+  if (!isSearch && state.items.length) {
     hero.appendChild(h('h1', { class: 'hero__title' }, t('tagline')));
   }
   const combo = h('div', {
@@ -982,9 +990,9 @@ function screenHome() {
   hero.appendChild(combo);
   wrap.appendChild(hero);
 
-  // Quick actions — large tap targets for the most common flows. A flex/grid row
-  // of logical-order children, so RTL flips the visual order automatically.
-  wrap.appendChild(quickActions(input));
+  // Quick actions — large tap targets for the most common flows (Home only).
+  // A flex/grid row of logical-order children, so RTL flips order automatically.
+  if (!isSearch) wrap.appendChild(quickActions(input));
 
   const results = h('div', { id: 'search-results', class: 'results', role: 'listbox',
     'aria-label': t('search') });
@@ -1055,7 +1063,7 @@ function screenHome() {
   // mount. renderResults() bails when `results` isn't connected (the guard that stops
   // stale debounced searches from touching detached nodes), and at build time `wrap`
   // is not in the DOM yet — so defer one tick so results.isConnected is true.
-  setTimeout(() => { renderResults(lastQuery); input.focus(); }, 0);
+  setTimeout(() => { renderResults(lastQuery); if (isSearch) input.focus(); }, 0);
   return wrap;
 }
 
@@ -1140,6 +1148,113 @@ function quickActions(searchInput) {
     h('span', { class: 'quickaction__label' }, t('rooms'))));
 
   return row;
+}
+
+/* ============================================================ *
+ *  SCREEN — Objects (every item across all storage)          *
+ * ============================================================ */
+// A flat, sortable, filterable view of every item — the counterpart to the
+// room-by-room Browse. Built entirely from bootstrap state (no new endpoint):
+// pigeon-holes, closets and plain units all pour their items into one list.
+const OBJECTS_SORT_KEY = 'objects_sort';
+const OBJECTS_FILTER_KEY = 'objects_filter';
+
+function objectRoomId(item) {
+  const pl = primaryLocation(item);
+  return pl && pl.room ? pl.room.id : null;
+}
+
+function screenObjects(q) {
+  q = q || {};
+  const wrap = h('div', { class: 'screen screen--objects' });
+  wrap.appendChild(pageHead(t('objects_title')));
+
+  let sort = q.sort || localStorage.getItem(OBJECTS_SORT_KEY) || 'newest';
+  let filter = q.status || localStorage.getItem(OBJECTS_FILTER_KEY) || 'all';
+
+  // Sort <select> + status filter chips.
+  const sortSel = h('select', { class: 'objbar__sort', 'aria-label': t('sort_label') },
+    ...[['newest', 'sort_newest'], ['name', 'sort_name'], ['room', 'sort_room'], ['status', 'sort_status']]
+      .map(([v, k]) => h('option', { value: v, ...(sort === v ? { selected: true } : {}) }, t(k))));
+  sortSel.addEventListener('change', () => {
+    sort = sortSel.value; localStorage.setItem(OBJECTS_SORT_KEY, sort); renderList();
+  });
+
+  const filterBar = h('div', { class: 'objbar__filters', role: 'group', 'aria-label': t('sort_status') });
+  const FILTERS = [['all', 'filter_all'], ['in_stock', 'in_stock'],
+    ['borrowed', 'nav_borrowed'], ['lost', 'lost'], ['archived', 'archived']];
+  function renderFilters() {
+    clear(filterBar);
+    FILTERS.forEach(([v, k]) => {
+      filterBar.appendChild(h('button', {
+        class: 'objchip' + (filter === v ? ' objchip--active' : ''),
+        type: 'button', 'aria-pressed': String(filter === v),
+        onclick: () => {
+          filter = v; localStorage.setItem(OBJECTS_FILTER_KEY, filter);
+          renderFilters(); renderList();
+        },
+      }, t(k)));
+    });
+  }
+  renderFilters();
+
+  wrap.appendChild(h('div', { class: 'objbar' },
+    h('label', { class: 'objbar__sortwrap' },
+      h('span', { class: 'objbar__sortlabel' }, t('sort_label')), sortSel),
+    filterBar,
+  ));
+
+  const listWrap = h('div', { class: 'objects-list' });
+  wrap.appendChild(listWrap);
+
+  const byNewest = (a, b) => (b.created_at || '').localeCompare(a.created_at || '');
+  const byName = (a, b) => itemName(a).localeCompare(itemName(b), undefined, { sensitivity: 'base' });
+  const byStatus = (a, b) => (a.status || '').localeCompare(b.status || '') || byNewest(a, b);
+
+  function renderList() {
+    clear(listWrap);
+    let items = state.items.slice();
+    if (filter !== 'all') items = items.filter(it => (it.status || 'in_stock') === filter);
+
+    if (!items.length) {
+      listWrap.appendChild(emptyState({
+        illo: 'box', title: t('objects_empty_title'), sub: t('objects_empty_sub'),
+        actionLabel: t('add_item'), actionHref: '#/add', actionIcon: ICONS.plus,
+      }));
+      return;
+    }
+
+    if (sort === 'room') {
+      const groups = new Map();          // roomId (or '' = no location) -> items[]
+      items.forEach(it => {
+        const rid = objectRoomId(it);
+        const key = rid == null ? '' : rid;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(it);
+      });
+      const order = state.rooms.slice().sort((a, b) => a.sort_order - b.sort_order).map(r => r.id);
+      order.push('');                    // "no location" group goes last
+      order.forEach(key => {
+        const g = groups.get(key);
+        if (!g || !g.length) return;
+        const room = key === '' ? null : state.roomById.get(key);
+        listWrap.appendChild(h('h2', { class: 'section-title' },
+          room ? localName(room) : t('no_location')));
+        const cards = h('div', { class: 'cards' });
+        g.sort(byName).forEach(it => cards.appendChild(itemCard(it)));
+        listWrap.appendChild(cards);
+      });
+    } else {
+      items.sort(sort === 'name' ? byName : sort === 'status' ? byStatus : byNewest);
+      const cards = h('div', { class: 'cards' });
+      items.forEach(it => cards.appendChild(itemCard(it)));
+      listWrap.appendChild(cards);
+    }
+    announce(tCount('items', items.length));
+  }
+
+  renderList();
+  return wrap;
 }
 
 async function quickScan(input) {
@@ -2045,6 +2160,7 @@ async function screenAddEdit(itemId, preselect) {
   // Best-effort product lookup with inline status. A sequence counter drops
   // stale responses (rescan / manual edit while a lookup is in flight).
   let lookupSeq = 0;
+  let lookupImage = null;   // product image URL from the last successful lookup
   async function runLookup(rawCode) {
     const seq = ++lookupSeq;
     bcStatus.hidden = false;
@@ -2061,6 +2177,12 @@ async function screenAddEdit(itemId, preselect) {
     if (data && (data.name || data.brand)) {
       if (data.name && !fEn.input.value) { fEn.input.value = data.name; clearFieldError(fEn.input); }
       if (data.brand && !fBrand.input.value) fBrand.input.value = data.brand;
+      // Offer the product image as the photo when the user has none yet.
+      // https only: mixed-content http images (some UPCitemdb hits) would be
+      // blocked in the browser and can't be stored server-side either.
+      if (data.image && /^https:/i.test(data.image) && !photoState.file && !photoState.url) {
+        lookupImage = data.image; photoState.url = data.image; renderPhoto();
+      }
       const nm = data.name || data.brand;
       bcStatus.className = 'lookup-status lookup-status--found';
       bcStatus.appendChild(iconEl(ICONS.check));
@@ -2093,6 +2215,10 @@ async function screenAddEdit(itemId, preselect) {
     bcChip.hidden = true;
     bcStatus.hidden = true;
     lookupSeq++;
+    // Drop a stale lookup image if it's still the one being shown.
+    if (lookupImage && photoState.url === lookupImage && !photoState.file) {
+      lookupImage = null; photoState.url = null; renderPhoto();
+    }
   });
 
   // --- Name fields (all three languages) ---
@@ -2188,6 +2314,14 @@ async function screenAddEdit(itemId, preselect) {
     // PATCHing the old value back would leave an open borrow on an
     // 'in_stock' item. The server PATCH only updates provided keys.
     if (statusSel && statusSel.value !== model.status) payload.status = statusSel.value;
+    // Tell the server which language the user typed in, so it can auto-translate
+    // the empty name languages (no-op unless a Google Translate key is set).
+    payload.source_lang = getLang();
+    // Persist the barcode-lookup product image when it's the shown photo and the
+    // user didn't take/choose their own — the server fetches + stores it.
+    if (lookupImage && !photoState.file && photoState.url === lookupImage) {
+      payload.image_url = lookupImage;
+    }
     if (!payload.name_en && !payload.name_fa && !payload.name_da) {
       // Inline field-level error (primary) + toast (secondary). The rule is
       // client-side by design: the server accepts nameless items, but an
@@ -3685,8 +3819,11 @@ async function route() {
   };
 
   // synchronous screens
-  if (parts.length === 0) return render(screenHome());
+  if (parts.length === 0) return render(screenHome('home'));
   const [a, b, c] = parts;
+
+  if (a === 'search') return render(screenHome('search'));
+  if (a === 'objects') return render(screenObjects(parseHashQuery()));
 
   if (a === 'browse') {
     if (!b) return render(screenBrowse());

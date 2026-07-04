@@ -1,5 +1,5 @@
 name: "Home Inventory"
-version: "2.0.2"
+version: "2.1.0"
 slug: "home_inventory"
 description: "Search, register and track household items across rooms, grid shelves and to-scale closet layouts. Trilingual EN/FA/DA, barcode + QR + NFC, borrow tracking."
 url: "https://github.com/photomohsen/Home-inventory-app"
@@ -21,5 +21,9 @@ homeassistant_api: true
 hassio_api: true
 # Least privilege — still intentionally NO: ports, map, host_network.
 # /data is always mounted writable without a map entry.
-options: {}
-schema: {}
+# google_translate_api_key (optional): paste a Google Cloud Translation v2 API
+# key to auto-translate item names into EN/FA/DA on save. Empty = feature off.
+options:
+  google_translate_api_key: ""
+schema:
+  google_translate_api_key: "str?"

@@ -22,6 +22,7 @@ Bind: waitress 0.0.0.0:8099 threads=8 in both modes.
 """
 
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -69,7 +70,55 @@ IMAGES_DIR = os.path.join(DATA_DIR, "images")
 INGRESS_ALLOWED_IP = "172.30.32.2"
 THUMB_MAX_EDGE = 256
 OFF_TIMEOUT = 4  # seconds — short so an offline box degrades fast
-OFF_UA = "HomeInventory/2.0 (Home Assistant add-on; https://github.com/photomohsen/Home-inventory-app)"
+OFF_UA = "HomeInventory/2.1 (Home Assistant add-on; https://github.com/photomohsen/Home-inventory-app)"
+
+# Product-lookup chain (all keyless). OFF-family hosts share one response shape;
+# UPCitemdb's keyless trial endpoint (100/day, 6/min) is the broad fallback.
+LOOKUP_TIMEOUT = 3  # per source — keep the whole chain snappy for the add form
+OFF_FAMILY = (
+    ("https://world.openfoodfacts.org", "openfoodfacts"),      # food
+    ("https://world.openproductsfacts.org", "openproductsfacts"),  # general household
+    ("https://world.openbeautyfacts.org", "openbeautyfacts"),  # cosmetics
+)
+
+# Google Cloud Translation v2 (user-supplied key -> add-on option). Dormant
+# until a key is set: with no key, auto-translate is a no-op (fail-open).
+TRANSLATE_TIMEOUT = 6
+GT_ENDPOINT = "https://translation.googleapis.com/language/translate/v2"
+
+
+def _data_options() -> dict:
+    """Add-on options (Supervisor writes them to /data/options.json). Cached.
+    DEV: file is absent, so callers fall through to environment overrides."""
+    global _OPTIONS_CACHE
+    if _OPTIONS_CACHE is not None:
+        return _OPTIONS_CACHE
+    opts = {}
+    try:
+        path = os.path.join(DATA_DIR, "options.json")
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+                if isinstance(loaded, dict):
+                    opts = loaded
+    except Exception:
+        opts = {}
+    _OPTIONS_CACHE = opts
+    return opts
+
+
+_OPTIONS_CACHE = None
+
+
+def _option(key, env=None, default=""):
+    """Config value: env override (dev/testing) wins, then options.json, then default."""
+    if env:
+        v = os.environ.get(env)
+        if v:
+            return v.strip()
+    v = _data_options().get(key)
+    return v if v not in (None, "") else default
+
 
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(IMAGES_DIR, exist_ok=True)
@@ -276,6 +325,186 @@ def normalize_barcode(code) -> str | None:
     if len(digits) == 12:  # UPC-A -> EAN-13
         digits = "0" + digits
     return digits
+
+
+# ---------------------------------------------------------------------------
+# External HTTP helpers: product lookup (keyless chain) + translation.
+# All best-effort — every path returns None on any failure (offline, DNS,
+# HTTP error, timeout, bad JSON) so the client never sees an error.
+# ---------------------------------------------------------------------------
+
+def _http_get_json(url, timeout=LOOKUP_TIMEOUT, headers=None):
+    req = urllib.request.Request(url, headers=headers or {"User-Agent": OFF_UA})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def _off_family_lookup(host, code):
+    """Open{Food,Products,Beauty}Facts share one v2 shape: product.{product_name,brands,image_*}."""
+    url = (f"{host}/api/v2/product/{code}.json"
+           "?fields=product_name,brands,image_front_url,image_url")
+    try:
+        data = _http_get_json(url)
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return None
+    except Exception:
+        app.logger.exception("unexpected error during OFF-family lookup for %s", code)
+        return None
+    if not isinstance(data, dict) or data.get("status") not in (1, "1"):
+        return None
+    p = data.get("product") or {}
+    name = (p.get("product_name") or "").strip()
+    brand = (p.get("brands") or "").strip()
+    if "," in brand:  # brands can be a comma-list — keep the first for a clean prefill
+        brand = brand.split(",")[0].strip()
+    image = (p.get("image_front_url") or p.get("image_url") or "").strip()
+    if not name and not brand:
+        return None
+    return {"name": name, "brand": brand, "image": image}
+
+
+def _upcitemdb_lookup(code):
+    """Keyless UPCitemdb trial (broad general-goods coverage; 100/day, 6/min)."""
+    url = f"https://api.upcitemdb.com/prod/trial/lookup?upc={code}"
+    try:
+        data = _http_get_json(url, headers={"User-Agent": OFF_UA,
+                                            "Accept": "application/json"})
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return None
+    except Exception:
+        app.logger.exception("unexpected error during UPCitemdb lookup for %s", code)
+        return None
+    items = (data or {}).get("items") if isinstance(data, dict) else None
+    if not items:
+        return None
+    it = items[0] or {}
+    name = (it.get("title") or "").strip()
+    brand = (it.get("brand") or "").strip()
+    imgs = it.get("images") or []
+    image = imgs[0].strip() if imgs and isinstance(imgs[0], str) else ""
+    if not name and not brand:
+        return None
+    return {"name": name, "brand": brand, "image": image}
+
+
+def _resolve_barcode(code):
+    """Cache -> OFF-family (food/general/beauty) -> UPCitemdb. Positive hits cached."""
+    conn = get_db()
+    try:
+        cached = conn.execute(
+            "SELECT name, brand, image, source FROM barcode_cache WHERE barcode=?",
+            (code,),
+        ).fetchone()
+        if cached is not None:
+            return {"name": cached["name"], "brand": cached["brand"],
+                    "image": cached["image"], "source": cached["source"]}
+        result = None
+        for host, src in OFF_FAMILY:
+            r = _off_family_lookup(host, code)
+            if r:
+                r["source"] = src
+                result = r
+                break
+        if result is None:
+            r = _upcitemdb_lookup(code)
+            if r:
+                r["source"] = "upcitemdb"
+                result = r
+        if result is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO barcode_cache (barcode, name, brand, image, source) "
+                "VALUES (?,?,?,?,?)",
+                (code, result.get("name", ""), result.get("brand", ""),
+                 result.get("image", ""), result.get("source", "")),
+            )
+            conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+def _google_translate(text, target, source, key):
+    """One string via Google Cloud Translation v2. None on any failure."""
+    if not text or not key:
+        return None
+    params = {"q": text, "target": target, "format": "text", "key": key}
+    if source:
+        params["source"] = source
+    url = GT_ENDPOINT + "?" + urllib.parse.urlencode(params)
+    try:
+        data = _http_get_json(url, timeout=TRANSLATE_TIMEOUT)
+        return (data["data"]["translations"][0]["translatedText"] or "").strip() or None
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError,
+            KeyError, IndexError, TypeError):
+        return None
+    except Exception:
+        # Never log `url` / traceback here — it carries the API key. Target only.
+        app.logger.error("unexpected error during translation to %s", target)
+        return None
+
+
+def _autofill_names(name_en, name_fa, name_da, source_lang):
+    """Fill EMPTY name languages from the one the user typed (Google Translate).
+    Never overwrites a non-empty field. No key -> returns the inputs unchanged."""
+    key = _option("google_translate_api_key", env="GOOGLE_TRANSLATE_API_KEY")
+    if not key:
+        return name_en, name_fa, name_da
+    names = {"en": (name_en or ""), "fa": (name_fa or ""), "da": (name_da or "")}
+    src = source_lang if source_lang in names and names[source_lang].strip() else None
+    if src is None:  # no usable hint -> use the first non-empty field as the source
+        src = next((l for l in ("en", "fa", "da") if names[l].strip()), None)
+    if src is None:
+        return name_en, name_fa, name_da
+    source_text = names[src]
+    for tgt in ("en", "fa", "da"):
+        if tgt == src or names[tgt].strip():
+            continue
+        tr = _google_translate(source_text, tgt, src, key)
+        if tr:
+            names[tgt] = tr
+    return names["en"], names["fa"], names["da"]
+
+
+def _looks_private_host(host):
+    """Block loopback/link-local/private/reserved targets (SSRF guard for image
+    import). Handles IPv6 (incl. bracketed + IPv4-mapped) via the ipaddress
+    module, and blocks obvious private hostnames / literals."""
+    host = (host or "").lower().strip("[]")
+    if not host or host == "localhost" or host.endswith(".local"):
+        return True
+    try:
+        addr = ipaddress.ip_address(host)
+        if getattr(addr, "ipv4_mapped", None):   # ::ffff:127.0.0.1 -> 127.0.0.1
+            addr = addr.ipv4_mapped
+        return (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified)
+    except ValueError:
+        pass  # not a literal IP — a hostname; fall back to prefix heuristics
+    if re.match(r"^(127\.|10\.|192\.168\.|169\.254\.|0\.)", host):
+        return True
+    return bool(re.match(r"^172\.(1[6-9]|2\d|3[01])\.", host))
+
+
+def _import_image_from_url(conn, item_id, url):
+    """Best-effort: fetch an https product image and store it as the item photo.
+    Guarded: https only, no private hosts, image/* content-type, 6 MiB cap."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme != "https" or _looks_private_host(parsed.hostname):
+            return False
+        req = urllib.request.Request(url, headers={"User-Agent": OFF_UA})
+        with urllib.request.urlopen(req, timeout=LOOKUP_TIMEOUT + 3) as resp:
+            if not (resp.headers.get("Content-Type", "")).startswith("image/"):
+                return False
+            raw = resp.read(6 * 1024 * 1024 + 1)
+        if len(raw) > 6 * 1024 * 1024:
+            return False
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        _store_item_image(conn, item_id, img)
+        return True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +821,10 @@ def api_item_create():
     barcode_format = body.get("barcode_format")
     notes = body.get("notes", "") or ""
     locations = body.get("locations") or []
+    # Auto-translate: fill the empty name languages from the one the user typed
+    # (no-op unless a Google Translate key is configured).
+    name_en, name_fa, name_da = _autofill_names(
+        name_en, name_fa, name_da, body.get("source_lang"))
     search = compute_search(name_en, name_fa, name_da, brand, tags, barcode)
 
     conn = get_db()
@@ -609,6 +842,11 @@ def api_item_create():
         _insert_locations(conn, item_id, locations)
         _ensure_one_primary(conn, item_id)
         conn.commit()
+        # Best-effort: pull the product image from a barcode lookup when the
+        # user didn't supply their own photo (guarded fetch, never fails create).
+        image_url = (body.get("image_url") or "").strip()
+        if image_url:
+            _import_image_from_url(conn, item_id, image_url)
         row = fetch_item_row(conn, item_id)
         return jsonify(serialize_item(conn, row)), 201
     finally:
@@ -644,6 +882,20 @@ def api_item_update(item_id):
             fields["tags"] = json.dumps(tags, ensure_ascii=False)
         if "barcode" in body:
             fields["barcode"] = normalize_barcode(body["barcode"])
+
+        # Auto-translate empty name languages when names were edited (no-op
+        # without a Google Translate key). Only fills blanks, never overwrites.
+        if any(k in body for k in ("name_en", "name_fa", "name_da")):
+            m_en = fields.get("name_en", row["name_en"])
+            m_fa = fields.get("name_fa", row["name_fa"])
+            m_da = fields.get("name_da", row["name_da"])
+            a_en, a_fa, a_da = _autofill_names(m_en, m_fa, m_da, body.get("source_lang"))
+            if a_en != m_en:
+                fields["name_en"] = a_en
+            if a_fa != m_fa:
+                fields["name_fa"] = a_fa
+            if a_da != m_da:
+                fields["name_da"] = a_da
 
         # Recompute search from the merged (new-or-existing) values.
         merged_tags = _tags_list(fields["tags"]) if "tags" in fields else _tags_list(row["tags"])
@@ -719,6 +971,42 @@ def _delete_image_dir(item_id: int) -> None:
             pass
 
 
+def _store_item_image(conn, item_id, img):
+    """Save `img` as the item's single photo + 256px thumbnail; update the row.
+    Returns (photo_path, thumb_path) relative to DATA_DIR."""
+    # Normalize to RGB (handles PNG alpha, CMYK, etc.) for JPEG output.
+    if img.mode not in ("RGB",):
+        img = img.convert("RGB")
+
+    item_dir = _item_image_dir(item_id)
+    os.makedirs(item_dir, exist_ok=True)
+    # Remove any prior images (one photo per item).
+    for name in os.listdir(item_dir):
+        try:
+            os.remove(os.path.join(item_dir, name))
+        except OSError:
+            pass
+
+    stem = uuid.uuid4().hex
+    full_name = f"{stem}.jpg"
+    thumb_name = f"{stem}.thumb.jpg"
+    img.save(os.path.join(item_dir, full_name), "JPEG", quality=88, optimize=True)
+
+    thumb = img.copy()
+    thumb.thumbnail((THUMB_MAX_EDGE, THUMB_MAX_EDGE), Image.LANCZOS)
+    thumb.save(os.path.join(item_dir, thumb_name), "JPEG", quality=82, optimize=True)
+
+    photo_path = f"images/{item_id}/{full_name}"
+    thumb_path = f"images/{item_id}/{thumb_name}"
+    conn.execute(
+        "UPDATE items SET photo_path=?, thumb_path=?, updated_at=datetime('now') "
+        "WHERE id=?",
+        (photo_path, thumb_path, item_id),
+    )
+    conn.commit()
+    return photo_path, thumb_path
+
+
 @app.route("/api/items/<int:item_id>/photo", methods=["POST"])
 def api_item_photo_upload(item_id):
     conn = get_db()
@@ -736,40 +1024,7 @@ def api_item_photo_upload(item_id):
         except Exception:
             return jsonify({"error": "invalid image"}), 400
 
-        # Normalize to RGB (handles PNG alpha, CMYK, etc.) for JPEG output.
-        if img.mode not in ("RGB",):
-            img = img.convert("RGB")
-
-        item_dir = _item_image_dir(item_id)
-        os.makedirs(item_dir, exist_ok=True)
-        # Remove any prior images (one photo per item in v1).
-        for name in os.listdir(item_dir):
-            try:
-                os.remove(os.path.join(item_dir, name))
-            except OSError:
-                pass
-
-        stem = uuid.uuid4().hex
-        full_name = f"{stem}.jpg"
-        thumb_name = f"{stem}.thumb.jpg"
-        full_fs = os.path.join(item_dir, full_name)
-        thumb_fs = os.path.join(item_dir, thumb_name)
-
-        img.save(full_fs, "JPEG", quality=88, optimize=True)
-
-        thumb = img.copy()
-        thumb.thumbnail((THUMB_MAX_EDGE, THUMB_MAX_EDGE), Image.LANCZOS)
-        thumb.save(thumb_fs, "JPEG", quality=82, optimize=True)
-
-        # Store paths relative to DATA_DIR.
-        photo_path = f"images/{item_id}/{full_name}"
-        thumb_path = f"images/{item_id}/{thumb_name}"
-        conn.execute(
-            "UPDATE items SET photo_path=?, thumb_path=?, updated_at=datetime('now') "
-            "WHERE id=?",
-            (photo_path, thumb_path, item_id),
-        )
-        conn.commit()
+        photo_path, thumb_path = _store_item_image(conn, item_id, img)
         return jsonify({
             "photo_url": _image_url(item_id, photo_path),
             "thumb_url": _image_url(item_id, thumb_path),
@@ -1911,40 +2166,25 @@ def api_layout_templates():
 @app.route("/api/lookup/<barcode>", methods=["GET"])
 def api_lookup(barcode):
     """
-    Server-side best-effort Open Food Facts v2 fetch. Returns {name,brand} or
-    null. NEVER errors the client: any failure / offline / miss -> 200 null.
+    Best-effort product lookup across a keyless chain, cached:
+      Open Food Facts (food) -> Open Products Facts (general household) ->
+      Open Beauty Facts (cosmetics) -> UPCitemdb trial (broad general goods).
+    Returns {name, brand, image, source} or null. NEVER errors the client:
+    any failure / offline / miss -> 200 null.
     """
     code = normalize_barcode(barcode)
     # Real product barcodes are numeric. Reject anything else so it can never be
-    # interpolated into the outbound URL (path/query injection guard).
+    # interpolated into an outbound URL (path/query injection guard).
     if not code or not code.isdigit():
         return jsonify(None)
-    url = (
-        f"https://world.openfoodfacts.org/api/v2/product/{code}.json"
-        "?fields=product_name,brands"
-    )
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": OFF_UA})
-        with urllib.request.urlopen(req, timeout=OFF_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
-    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
-        # Expected: offline, DNS failure, HTTP error, timeout, bad JSON.
-        return jsonify(None)
+        result = _resolve_barcode(code)
     except Exception:
-        app.logger.exception("unexpected error during OFF lookup for %s", code)
+        app.logger.exception("barcode resolve failed for %s", code)
+        result = None
+    if not result or not (result.get("name") or result.get("brand")):
         return jsonify(None)
-
-    if not isinstance(data, dict) or data.get("status") not in (1, "1"):
-        return jsonify(None)
-    product = data.get("product") or {}
-    name = (product.get("product_name") or "").strip()
-    brand = (product.get("brands") or "").strip()
-    # brands can be a comma-list; keep the first for a clean prefill.
-    if "," in brand:
-        brand = brand.split(",")[0].strip()
-    if not name and not brand:
-        return jsonify(None)
-    return jsonify({"name": name, "brand": brand})
+    return jsonify(result)
 
 
 # ---------------------------------------------------------------------------

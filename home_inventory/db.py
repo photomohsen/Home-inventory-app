@@ -153,6 +153,18 @@ CREATE TABLE IF NOT EXISTS nfc_tags (
   scan_count      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_nfc_target ON nfc_tags(target_kind, target_id);
+
+-- Barcode lookup cache (best-effort product data from the external keyless
+-- chain). Positive hits only, so a repeat scan is instant and never re-burns
+-- the UPCitemdb daily quota. Not user data — safe to clear any time.
+CREATE TABLE IF NOT EXISTS barcode_cache (
+  barcode    TEXT PRIMARY KEY,
+  name       TEXT NOT NULL DEFAULT '',
+  brand      TEXT NOT NULL DEFAULT '',
+  image      TEXT NOT NULL DEFAULT '',
+  source     TEXT NOT NULL DEFAULT '',
+  fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 # All tables, for admin wipe (children first so cascade/order is harmless).

@@ -10,6 +10,23 @@ authenticated by HA automatically (no extra login), works in the HA companion ap
 over your remote URL, and stores all data inside the add-on (survives restarts and
 updates).
 
+## What's new in v2.1
+
+- **Single-screen landing** — the Home screen is compacted (mobile-first) so the
+  search box and quick actions are visible without scrolling on phones and laptops.
+- **Five-tab navigation** — an explicit **Home** button plus a dedicated **Search**
+  tab, alongside **Browse**, **Borrowed** and the new **Objects** tab (no more
+  tapping the title to get home).
+- **Objects view** — one flat list of *every* item across all rooms, pigeon-holes and
+  closets, with sort (newest / name / room / status) and status filters.
+- **Smarter barcode lookup** — scanning now queries a keyless chain of product
+  databases (Open Food Facts → Open Products Facts → Open Beauty Facts → UPCitemdb),
+  so general household goods — not just groceries — auto-fill their name, brand and
+  photo. Results are cached so a repeat scan is instant.
+- **Auto-translation** *(optional)* — set a Google Cloud Translation API key in the
+  add-on config and item names you type in one language are auto-translated into the
+  other two on save, so everything is findable in any language.
+
 ## What's new in v2.0
 
 - **Full visual redesign** — a warm editorial look (paper tones, Fraunces serif,
@@ -36,8 +53,14 @@ updates).
 - **Closet composer** — map a wardrobe from a template (incl. an L-shaped PAX) or from
   scratch: add sections and zones, set widths and heights, and watch a live to-scale
   blueprint update as you go.
-- **Barcode & QR scanning** with the phone camera (fully offline; optional online
-  product-name lookup when internet is available).
+- **Barcode & QR scanning** with the phone camera (fully offline). When online, a
+  keyless multi-source lookup (Open Food Facts → Open Products Facts → Open Beauty
+  Facts → UPCitemdb) auto-fills an item's **name, brand and photo** from its barcode —
+  covering general household goods, not just food — and caches hits for next time.
+- **Objects view** — a single sortable, filterable list of every item across all
+  storage, complementing the room-by-room Browse.
+- **Auto-translate item names** *(optional)* — with a Google Cloud Translation API key
+  configured, a name typed in one language is filled into the other two on save.
 - **NFC tags** — assign a Home Assistant tag to an item, a unit or a door
   compartment. Scanning an item tag smart-toggles it (check out ↔ check in); scanning
   a place tag opens that spot on the map. See below.

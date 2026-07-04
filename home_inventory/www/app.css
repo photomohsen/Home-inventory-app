@@ -276,21 +276,24 @@ mark{
 /* Bottom tab bar: paper, hairline top, sage active. */
 .tabbar{
   position:fixed; inset-inline:0; inset-block-end:0; z-index:30;
-  display:flex; justify-content:center; gap:var(--sp-2);
+  display:flex; justify-content:center; gap:var(--sp-1);
   padding-block:var(--sp-1) calc(var(--sp-1) + env(safe-area-inset-bottom,0px));
   background:var(--bg);
   border-block-start:1px solid var(--border);
 }
 .tabbar__link{
-  flex:1; max-inline-size:140px;
+  flex:1 1 0; min-inline-size:0; max-inline-size:96px;
   display:flex; flex-direction:column; align-items:center; gap:2px;
   min-block-size:var(--tap); padding-block:var(--sp-1);
   color:var(--text-dim); font-size:var(--fs-xs);
   transition:color var(--t-fast) var(--ease);
 }
 @media (hover:hover){ .tabbar__link:hover{ color:var(--text); } }
-.tabbar__icon{ inline-size:24px; block-size:24px; }
-.tabbar__label{ line-height:1; }
+.tabbar__icon{ inline-size:24px; block-size:24px; flex:none; }
+.tabbar__label{
+  line-height:1; max-inline-size:100%;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
 .tabbar__link.is-active{ color:var(--primary); font-weight:700; }
 
 /* FAB (persistent camera quick-add) */
@@ -464,6 +467,59 @@ mark{
   display:flex; align-items:center; justify-content:center;
   background:var(--accent); color:var(--on-accent);
   border-radius:var(--r-full); font-size:11px; font-weight:700;
+}
+
+/* =====================================================================
+   6b. Objects view — sort control + status filter chips
+   ===================================================================== */
+.objbar{
+  display:flex; align-items:center; flex-wrap:wrap; gap:var(--sp-2) var(--sp-3);
+  justify-content:space-between;
+}
+.objbar__sortwrap{ display:inline-flex; align-items:center; gap:var(--sp-2); }
+.objbar__sortlabel{
+  font-size:11px; font-weight:650; letter-spacing:var(--caps-ls);
+  text-transform:uppercase; color:var(--text-dim);
+}
+.objbar__sort{
+  min-block-size:36px; padding-inline:var(--sp-3); padding-block:var(--sp-1);
+  border:1px solid var(--border); border-radius:var(--r-md);
+  background:var(--surface); color:var(--text);
+  font-family:inherit; font-size:var(--fs-sm); cursor:pointer;
+}
+.objbar__filters{ display:flex; flex-wrap:wrap; gap:var(--sp-1); }
+.objchip{
+  min-block-size:32px; padding-inline:var(--sp-3); padding-block:6px;
+  border:1px solid var(--border); border-radius:var(--r-full);
+  background:var(--surface); color:var(--text-dim);
+  font-size:var(--fs-sm); font-weight:600; cursor:pointer;
+  transition:background var(--t-fast) var(--ease), color var(--t-fast) var(--ease),
+             border-color var(--t-fast) var(--ease);
+}
+.objchip:hover{ border-color:var(--border-strong); color:var(--text); }
+.objchip--active{ background:var(--primary); color:var(--on-primary); border-color:var(--primary); }
+.objects-list{ display:flex; flex-direction:column; gap:var(--sp-4); }
+
+/* Search tab: the search field sits right under the page title. */
+.screen--search .hero{ padding-block-start:0; }
+
+/* =====================================================================
+   6c. Compact landing so search + quick actions fit one screen without
+   scrolling (mobile-first — the primary complaint was scrolling to reach
+   the options). Recent items still scroll below the fold.
+   ===================================================================== */
+@media (max-width:767px){
+  .view{
+    padding-block:var(--sp-2)
+                  calc(var(--tap) + var(--sp-5) + env(safe-area-inset-bottom,0px));
+  }
+  .screen--home{ gap:var(--sp-3); }
+  .hero{ padding-block:var(--sp-2) 0; }
+  .hero__title{ font-size:1.35rem; margin-block-end:var(--sp-2); }
+  .searchbox__input{ padding-block:var(--sp-2); font-size:var(--fs-md); }
+  .quickactions{ gap:var(--sp-1); }
+  .quickaction{ min-block-size:68px; gap:var(--sp-1); }
+  .quickaction__icon{ inline-size:22px; block-size:22px; }
 }
 
 /* =====================================================================
