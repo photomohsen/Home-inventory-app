@@ -406,7 +406,7 @@ function closetSchematic(layout, opts = {}) {
     marks.forEach(m => {
       scale.appendChild(h('span', {
         class: 'closet__tick',
-        style: `inset-block-start:${(m / totalH) * 100}%`,
+        style: `inset-block-end:${(m / totalH) * 100}%`,
       }, fmtNum(m)));
     });
     draw.appendChild(scale);
